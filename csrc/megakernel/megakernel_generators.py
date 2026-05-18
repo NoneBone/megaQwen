@@ -10,7 +10,7 @@ from megakernel_weights import load_qwen3_weights
 
 
 class MegakernelGenerator:
-    def __init__(self, model_name="Qwen/Qwen3-0.6B", max_seq_len=2048):
+    def __init__(self, model_name="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", max_seq_len=2048):
         weights = load_qwen3_weights(model_name, max_seq_len=max_seq_len)
         kernel = _compile_decode_kernel()
         self.decoder = kernel.MegakernelDecoder(
@@ -64,7 +64,7 @@ class MegakernelGenerator:
 
 
 class MegakernelPrefillGenerator:
-    def __init__(self, model_name="Qwen/Qwen3-0.6B", max_seq_len=2048, max_prefill_len=512):
+    def __init__(self, model_name="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", max_seq_len=2048, max_prefill_len=512):
         weights = load_qwen3_weights(model_name, max_seq_len=max_seq_len)
         kernel = _compile_prefill_kernel()
         self.decoder = kernel.MegakernelPrefillDecoder(
@@ -129,7 +129,7 @@ class MegakernelPrefillGenerator:
 
 
 class MegakernelFusedPrefillGenerator:
-    def __init__(self, model_name="Qwen/Qwen3-0.6B", max_seq_len=2048, max_prefill_len=64):
+    def __init__(self, model_name="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", max_seq_len=2048, max_prefill_len=64):
         weights = load_qwen3_weights(model_name, max_seq_len=max_seq_len)
         kernel = _compile_fused_prefill_kernel()
         self.decoder = kernel.MegakernelFusedPrefillDecoder(

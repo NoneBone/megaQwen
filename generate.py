@@ -170,7 +170,7 @@ def precompute_rope_freqs(head_dim: int, max_seq_len: int, theta: float = 100000
 class MegakernelModel:
     """Wrapper for running Qwen3-0.6B with megakernels."""
 
-    def __init__(self, model_name="Qwen/Qwen3-0.6B", device="cuda"):
+    def __init__(self, model_name="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", device="cuda"):
         print("Loading model weights...")
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16, device_map=device

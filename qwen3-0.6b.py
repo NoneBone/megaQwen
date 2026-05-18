@@ -866,7 +866,7 @@ def verify_single_prompt(tokenizer, hf_model, triton_model, prompt: str, max_new
 def verify_outputs():
     """Verify Triton implementation matches HuggingFace on multiple prompts."""
     print("Loading HuggingFace model...")
-    model_name = "Qwen/Qwen3-0.6B"
+    model_name = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_name,

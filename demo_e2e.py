@@ -451,7 +451,7 @@ def run_demo():
 
     # Load model
     print("\nLoading Qwen3-0.6B model...")
-    model_name = "Qwen/Qwen3-0.6B"
+    model_name = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="cuda")
     hf_model.eval()

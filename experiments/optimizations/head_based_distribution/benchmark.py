@@ -290,7 +290,7 @@ def load_weights_from_hf():
     from transformers import AutoModelForCausalLM
     print("Loading model weights from HuggingFace...")
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", torch_dtype=torch.bfloat16, device_map="cuda", local_files_only=True
+        "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", torch_dtype=torch.bfloat16, device_map="cuda", local_files_only=True
     )
     state_dict = {k: v.clone() for k, v in model.state_dict().items()}
     del model

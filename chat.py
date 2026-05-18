@@ -339,12 +339,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     return module
 
+COMMON_MODEL_PATH = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B"
 
 def load_weights_from_hf():
     """Load weights from HuggingFace without keeping the model."""
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", torch_dtype=torch.bfloat16, device_map="cuda", local_files_only=True
+        COMMON_MODEL_PATH, torch_dtype=torch.bfloat16, device_map="cuda", local_files_only=True
     )
     state_dict = {k: v.clone() for k, v in model.state_dict().items()}
     del model
@@ -357,7 +358,7 @@ class MegakernelChat:
         self.device = "cuda"
 
         print("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(COMMON_MODEL_PATH, local_files_only=True)
 
         print("Compiling custom CUDA kernels...")
         self.kernel = compile_kernel()

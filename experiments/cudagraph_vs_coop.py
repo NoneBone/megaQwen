@@ -880,7 +880,7 @@ def main():
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B",
+        "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B",
         torch_dtype=torch.bfloat16,
         device_map="cuda"
     )
