@@ -74,6 +74,24 @@ class MegakernelPrefillGenerator:
             weights["lm_head_weight"],
             weights["cos_table"],
             weights["sin_table"],
+            weights.get("split_q_w4_packed", []),
+            weights.get("split_q_w4_scales", []),
+            weights.get("split_q_w4_codebook", []),
+            weights.get("split_k_w4_packed", []),
+            weights.get("split_k_w4_scales", []),
+            weights.get("split_k_w4_codebook", []),
+            weights.get("split_v_w4_packed", []),
+            weights.get("split_v_w4_scales", []),
+            weights.get("split_v_w4_codebook", []),
+            weights.get("split_o_w4_packed", []),
+            weights.get("split_o_w4_scales", []),
+            weights.get("split_o_w4_codebook", []),
+            weights.get("split_gateup_w4_packed", []),
+            weights.get("split_gateup_w4_scales", []),
+            weights.get("split_gateup_w4_codebook", []),
+            weights.get("split_down_w4_packed", []),
+            weights.get("split_down_w4_scales", []),
+            weights.get("split_down_w4_codebook", []),
             NUM_LAYERS,
             max_seq_len,
             max_prefill_len,
@@ -206,13 +224,13 @@ def main():
 
     if args.fused_prefill:
         print("Using fused prefill megakernel + decode kernels...")
-        gen = MegakernelFusedPrefillGenerator(max_prefill_len=64)
+        gen = MegakernelFusedPrefillGenerator(max_prefill_len=64)# FIX: Output: ellingingingingingingingingNingNingNingNingNingN
     elif args.prefill:
         print("Using cuBLAS prefill + decode kernels...")
         gen = MegakernelPrefillGenerator()
     else:
         print("Using decode-only kernel...")
-        gen = MegakernelGenerator()
+        gen = MegakernelGenerator()# Output:  Lina. I'm a 22-year-old student from China. I'm interested in studying
 
     prompt = "Hello, my name is"
     if not args.benchmark:
