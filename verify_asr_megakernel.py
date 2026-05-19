@@ -34,8 +34,8 @@ def _wav_duration_s(path: str) -> float | None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--audio", required=True)
+    ap.add_argument("--model", default="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-ASR-0.6B")
+    ap.add_argument("--audio", default="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/AUDIO/hello.wav")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument(
@@ -107,7 +107,7 @@ def main() -> None:
         "MEGAQWEN_SPLIT_O_W4=" + os.environ.get("MEGAQWEN_SPLIT_O_W4", ""),
         "MEGAQWEN_SPLIT_FFN_W4=" + os.environ.get("MEGAQWEN_SPLIT_FFN_W4", ""),
         "MEGAQWEN_SPLIT_FFN_W4_FUSED=" + os.environ.get("MEGAQWEN_SPLIT_FFN_W4_FUSED", ""),
-        "MEGAQWEN_SPLIT_KV_LAYOUT=" + os.environ.get("MEGAQWEN_SPLIT_KV_LAYOUT", ""),
+        "MEGAQWEN_SPLIT_KV_LAYOUT=" + os.environ.get("MEGAQWEN_SPLIT_KV_LAYOUT", ""), # SPLIT_KV
         "MEGAQWEN_SPLIT_KV_PAGED=" + os.environ.get("MEGAQWEN_SPLIT_KV_PAGED", ""),
         "MEGAQWEN_SPLIT_KV_BLOCK_SIZE=" + os.environ.get("MEGAQWEN_SPLIT_KV_BLOCK_SIZE", ""),
         "MEGAQWEN_DEBUG_PAGED_KV=" + os.environ.get("MEGAQWEN_DEBUG_PAGED_KV", ""),

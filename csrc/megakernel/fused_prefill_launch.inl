@@ -45,9 +45,8 @@ static inline bool prefill_causal_attention_flash_ext_sdpa(
             c10::nullopt,
             0.0,
             true,
-            (double)attn_scale,
-            enable_gqa
-        );
+            std::optional<double>(attn_scale)
+        );// enable_gqa
 
         auto out_write = out4;
         if (out_write.scalar_type() != torch::kBFloat16) {
