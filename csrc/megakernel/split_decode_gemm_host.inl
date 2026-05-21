@@ -1,3 +1,4 @@
+// Decode launch entry
 #include "split_decode_gemm_host_utils.inl"
 extern "C" void launch_split_decode_gemm(
     const int* input_token_id,    // device [1]
@@ -502,7 +503,7 @@ extern "C" void launch_split_decode_gemm(
                 );
                 qkv_done = qkv_gemv_done;
             }
-            if (!qkv_done) {
+            if (!qkv_done) {// attn后端为2时发生出错的地方
                 qkv_gemmex_done = true;
                 if (!_cublas_check(cublasGemmEx(
                     cublas_handle,
@@ -575,8 +576,8 @@ extern "C" void launch_split_decode_gemm(
             // by default to reduce register pressure / occupancy collapse on AD102.
             if (attn_warps > 3) attn_warps = 3;
         }
-        if (attn_impl == 3) {
-            bool flash_use_split_reduce =
+        if (attn_impl == 3) {// 包含3种变体：V3-GQA、V3-S0、V3-Combine, 以及FP8、TC 旋钮.
+            bool flash_use_split_reduce = // 置零以使能 decode_attention_cache_flash_decode_kernel_t
                 (split_attn_chunk_size > 0 && split_attn_max_chunks > 0 &&
                  split_attn_partial_m != nullptr && split_attn_partial_s != nullptr &&
                  split_attn_partial_out != nullptr);
@@ -600,9 +601,9 @@ extern "C" void launch_split_decode_gemm(
                         : nullptr;
                 if (kv_fp8_enabled) {
                     if (use_gqa_phase1) {
-                        if (use_gqa_simt_fast || !k_fp8_enabled) {
+                        if (use_gqa_simt_fast || !k_fp8_enabled) { // share 且 tc
                             if (gqa_phase_debug_ptr != nullptr) {
-                                if (k_fp8_enabled) {
+                                if (k_fp8_enabled) {//kV_FP8 + 关闭 TC + 开启调试模式
                                     decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, false, true><<<blocks, threads, 0, stream>>>(
                                         (const __nv_bfloat16*)q_proj_bf16,
                                         (const __nv_bfloat16*)layer_k_cache,
@@ -635,8 +636,8 @@ extern "C" void launch_split_decode_gemm(
                                         0,
                                         gqa_phase_debug_ptr
                                     );
-                                } else {
-                                    decode_attention_cache_flash_phase1_gqa2_kernel_t<false, true, false, true><<<blocks, threads, 0, stream>>>(
+                                } else {// V_FP8 + 调试模式
+                                    decode_attention_cache_flash_phase1_gqa2_kernel_t<false, true, false, true><<<blocks, threads, 0, stream>>>( 
                                     (const __nv_bfloat16*)q_proj_bf16,
                                     (const __nv_bfloat16*)layer_k_cache,
                                     (const __nv_bfloat16*)layer_v_cache,
@@ -670,7 +671,7 @@ extern "C" void launch_split_decode_gemm(
                                 );
                                 }
                             } else {
-                                if (k_fp8_enabled) {
+                                if (k_fp8_enabled) {// kV_FP8 + 关闭 TC + 关闭调试模式
                                     decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, false, false><<<blocks, threads, 0, stream>>>(
                                         (const __nv_bfloat16*)q_proj_bf16,
                                         (const __nv_bfloat16*)layer_k_cache,
@@ -703,7 +704,7 @@ extern "C" void launch_split_decode_gemm(
                                         0,
                                         nullptr
                                     );
-                                } else {
+                                } else {// V_FP8 + 关闭 TC + 关闭调试模式
                                     decode_attention_cache_flash_phase1_gqa2_kernel_t<false, true, false, false><<<blocks, threads, 0, stream>>>(
                                         (const __nv_bfloat16*)q_proj_bf16,
                                         (const __nv_bfloat16*)layer_k_cache,
@@ -739,7 +740,7 @@ extern "C" void launch_split_decode_gemm(
                                 }
                             }
                         } else {
-                            if (gqa_phase_debug_ptr != nullptr) {
+                            if (gqa_phase_debug_ptr != nullptr) {// kV_FP8 + 开启 TC + 开启调试模式
                                 decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, true, true><<<blocks, threads, flash_gqa_tc_shared_bytes, stream>>>(
                                 (const __nv_bfloat16*)q_proj_bf16,
                                 (const __nv_bfloat16*)layer_k_cache,
@@ -772,7 +773,7 @@ extern "C" void launch_split_decode_gemm(
                                 flash_fp8_tc_qk,
                                 gqa_phase_debug_ptr
                             );
-                            } else {
+                            } else {// kV_FP8 + 开启 TC
                                 decode_attention_cache_flash_phase1_gqa2_kernel_t<true, true, true, false><<<blocks, threads, flash_gqa_tc_shared_bytes, stream>>>(
                             (const __nv_bfloat16*)q_proj_bf16,
                             (const __nv_bfloat16*)layer_k_cache,
@@ -807,7 +808,7 @@ extern "C" void launch_split_decode_gemm(
                         );
                             }
                         }
-                    } else {
+                    } else {// v3-S0
                         if (k_fp8_enabled) {
                             decode_attention_cache_flash_phase1_kernel_t<true><<<blocks, threads, 0, stream>>>(
                                 (const __nv_bfloat16*)q_proj_bf16,
@@ -880,8 +881,8 @@ extern "C" void launch_split_decode_gemm(
                             );
                         }
                     }
-                } else {
-                    if (use_gqa_phase1) {
+                } else {// 完全未启用 FP8
+                    if (use_gqa_phase1) {// 无 FP8 的GQA
                         if (gqa_phase_debug_ptr != nullptr) {
                             decode_attention_cache_flash_phase1_gqa2_kernel_t<false, false, false, true><<<blocks, threads, 0, stream>>>(
                                 (const __nv_bfloat16*)q_proj_bf16,
@@ -986,6 +987,7 @@ extern "C" void launch_split_decode_gemm(
                         );
                     }
                 }
+                // part > 1 会插入以下kernel，TODO: part指的时什么？
                 if (parts > 1 && flash_part_m_dev != nullptr && flash_part_s_dev != nullptr && flash_part_out_dev != nullptr) {
                     decode_attention_cache_flash_reduce_parts_kernel<<<NUM_Q_HEADS * split_attn_max_chunks, 128, 0, stream>>>(
                         (const float*)flash_part_m_dev,
@@ -1002,6 +1004,7 @@ extern "C" void launch_split_decode_gemm(
                         position_ptr
                     );
                 }
+                // 上方的phase 1 内核，全部采用相同的 reduce phase2
                 decode_attention_cache_splitk_phase2_kernel<<<NUM_Q_HEADS, 128, 0, stream>>>(
                     (const float*)split_attn_partial_m,
                     (const float*)split_attn_partial_s,
@@ -1250,7 +1253,7 @@ extern "C" void launch_split_decode_gemm(
                         std::printf("\n");
                     }
                 }
-            } else {
+            } else {// 合并的内核 V3
                 int threads = attn_warps * WARP_SIZE;
                 if (kv_fp8_enabled) {
                     decode_attention_cache_flash_decode_kernel_t<true><<<NUM_Q_HEADS, threads, 0, stream>>>(
@@ -1481,7 +1484,7 @@ extern "C" void launch_split_decode_gemm(
         } else if (attn_impl == 2 && split_attn_chunk_size > 0 && split_attn_max_chunks > 0 &&
             split_attn_partial_m != nullptr && split_attn_partial_s != nullptr && split_attn_partial_out != nullptr) {
             int blocks = NUM_Q_HEADS * split_attn_max_chunks;
-            int threads = attn_warps * WARP_SIZE;
+            int threads = attn_warps * WARP_SIZE;// 下方核函数会导致后续出错；如果替换为其他正常的kernel，则没有该问题
             decode_attention_cache_splitk_phase1_kernel<<<blocks, threads, 0, stream>>>(
                 (const __nv_bfloat16*)q_proj_bf16,
                 (const __nv_bfloat16*)layer_k_cache,
@@ -1618,7 +1621,7 @@ extern "C" void launch_split_decode_gemm(
                 );
                 o_done = o_gemv_done;
             }
-            if (!o_done) {
+            if (!o_done) {// 首次出错地方
                 o_gemmex_done = true;
                 if (!_cublas_check(cublasGemmEx(
                     cublas_handle,
