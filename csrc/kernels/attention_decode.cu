@@ -319,6 +319,9 @@ __global__ void attention_decode_kernel_v2(
 }
 
 // Wrapper function callable from PyTorch
+// q layout:   [num_seqs, H_q, D]
+// K, V layout (new): [num_seqs, H_kv, S_kv, D]  — head‑major KV context
+// O layout:   [num_seqs, H_q, D]
 extern "C" void launch_attention_decode(
     const void* q,
     const void* k_cache,
