@@ -26,6 +26,7 @@ def _compile_kernels():
     rms_norm_src = _get_cuda_source("rms_norm.cu")
     silu_mul_src = _get_cuda_source("silu_mul.cu")
     rope_src = _get_cuda_source("rope.cu")
+    attention_prefill_src = _get_cuda_source("attention_prefill.cu")
     attention_decode_src = _get_cuda_source("attention_decode.cu")
     audio_attention_src = _get_cuda_source("audio_attention.cu")
 
@@ -79,20 +80,31 @@ extern "C" void launch_rope_single(
     cudaStream_t stream
 );
 
-extern "C" void launch_attention_decode(
-    const void* q,
-    const void* k_cache,
-    const void* v_cache,
-    void* out,
-    int batch_size,
-    int cache_len,
-    int n_q_heads,
-    int n_kv_heads,
-    int head_dim,
-    int max_seq_len,
-    float scale,
-    cudaStream_t stream
+extern "C" void launch_flash_attention_prefill(
+    const void* Q,
+    const void* K,
+    const void* V,
+    void*       O,
+    int B, int S, int H_q, int H_kv, int head_dim,
+    cudaStream_t stream,
+    float*       lse
 );
+
+#define DECLARE_LAUNCH_ATTENTION_DECODE(VERSION)                         \
+extern "C" void launch_attention_decode##VERSION(                     \
+    const void* q,                                                     \
+    const void* k_cache,                                               \
+    const void* v_cache,                                               \
+    void* out,                                                         \
+    int batch_size,                                                    \
+    int cache_len,                                                     \
+    int n_q_heads,                                                     \
+    int n_kv_heads,                                                    \
+    int head_dim,                                                      \
+    int max_seq_len,                                                   \
+    float scale,                                                       \
+    cudaStream_t stream                                                \
+)
 
 extern "C" void launch_audio_attention(
     const void* q,
@@ -246,13 +258,64 @@ torch::Tensor cuda_rope_single(
     return out;
 }
 
-torch::Tensor cuda_attention_decode(
+#define DEFINE_CUDA_ATTENTION_DECODE(VERSION)                              \
+torch::Tensor cuda_attention_decode##VERSION(                            \
+    torch::Tensor q,                                                     \
+    torch::Tensor k_cache,                                               \
+    torch::Tensor v_cache,                                               \
+    int cache_len                                                        \
+) {                                                                      \
+    TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");                  \
+    TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");     \
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous");               \
+                                                                          \
+    int batch = q.size(0);                                               \
+    int n_q_heads = q.size(1);                                           \
+    int head_dim = q.size(3);                                            \
+    int n_kv_heads = k_cache.size(1);                                    \
+    int max_seq_len = k_cache.size(2);                                   \
+                                                                          \
+    float scale = 1.0f / sqrtf((float)head_dim);                         \
+                                                                          \
+    auto q_flat = q.squeeze(2).contiguous();                             \
+    auto out = torch::empty_like(q_flat);                                \
+                                                                          \
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();    \
+                                                                          \
+    launch_attention_decode##VERSION(                                   \
+        q_flat.data_ptr(),                                               \
+        k_cache.data_ptr(),                                              \
+        v_cache.data_ptr(),                                              \
+        out.data_ptr(),                                                  \
+        batch,                                                           \
+        cache_len,                                                       \
+        n_q_heads,                                                       \
+        n_kv_heads,                                                      \
+        head_dim,                                                        \
+        max_seq_len,                                                     \
+        scale,                                                           \
+        stream                                                           \
+    );                                                                   \
+                                                                          \
+    return out.unsqueeze(2);                                             \
+}
+
+DECLARE_LAUNCH_ATTENTION_DECODE(_v1);
+DECLARE_LAUNCH_ATTENTION_DECODE();
+DECLARE_LAUNCH_ATTENTION_DECODE(_v3);
+DECLARE_LAUNCH_ATTENTION_DECODE(_v4);
+DEFINE_CUDA_ATTENTION_DECODE(_v1)
+DEFINE_CUDA_ATTENTION_DECODE()
+DEFINE_CUDA_ATTENTION_DECODE(_v3)
+DEFINE_CUDA_ATTENTION_DECODE(_v4)
+
+torch::Tensor cuda_attention_prefill(
     torch::Tensor q,
     torch::Tensor k_cache,
     torch::Tensor v_cache,
     int cache_len
 ) {
-    // q: (batch, n_q_heads, 1, head_dim)
+    // q: (batch, n_q_heads, cache_len, head_dim)
     // k_cache, v_cache: (batch, n_kv_heads, max_seq_len, head_dim)
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");
@@ -264,30 +327,29 @@ torch::Tensor cuda_attention_decode(
     int n_kv_heads = k_cache.size(1);
     int max_seq_len = k_cache.size(2);
 
-    float scale = 1.0f / sqrtf((float)head_dim);
+    // float scale = 1.0f / sqrtf((float)head_dim);
 
     // Flatten q for kernel: (batch, n_q_heads, head_dim)
-    auto q_flat = q.squeeze(2).contiguous();
-    auto out = torch::empty_like(q_flat);
+    // auto q_flat = q.squeeze(2).contiguous();
+    auto out = torch::empty_like(q);
 
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
-    launch_attention_decode(
-        q_flat.data_ptr(),
+    launch_flash_attention_prefill(
+        q.data_ptr(),
         k_cache.data_ptr(),
         v_cache.data_ptr(),
         out.data_ptr(),
         batch,
-        cache_len,
+        max_seq_len,
         n_q_heads,
         n_kv_heads,
         head_dim,
-        max_seq_len,
-        scale,
-        stream
+        stream,
+        nullptr
     );
 
     // Reshape back to (batch, n_q_heads, 1, head_dim)
-    return out.unsqueeze(2);
+    return out;
 }
 
 torch::Tensor cuda_audio_attention(
@@ -346,7 +408,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu_mul", &cuda_silu_mul, "CUDA fused SiLU * mul");
     m.def("rope", &cuda_rope, "CUDA RoPE (prefill)");
     m.def("rope_single", &cuda_rope_single, "CUDA RoPE (decode single token)");
+    m.def("attention_prefill", &cuda_attention_prefill, "CUDA attention decode");
     m.def("attention_decode", &cuda_attention_decode, "CUDA attention decode");
+    m.def("attention_decode_v1", &cuda_attention_decode_v1, "CUDA attention decode");
+    m.def("attention_decode_v3", &cuda_attention_decode_v3, "CUDA attention decode");
+    m.def("attention_decode_v4", &cuda_attention_decode_v4, "CUDA attention decode");
     m.def("audio_attention", &cuda_audio_attention, "CUDA audio self-attention (B,H,T,D)");
 }
 """
@@ -357,6 +423,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         + silu_mul_src
         + "\n\n"
         + rope_src
+        + "\n\n"
+        + attention_prefill_src
         + "\n\n"
         + attention_decode_src
         + "\n\n"

@@ -259,7 +259,7 @@ class Qwen3Attention:
 
     def attention_decode(self, q, k_cache, v_cache, cache_len):
         if self.backend == Backend.CUDA:
-            return self.cuda_kernels.attention_decode(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len)
+            return self.cuda_kernels.attention_decode_v3(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # decode kernel 调度
         else:
             return attention_decode_torch(q, k_cache, v_cache, cache_len)
 
@@ -285,21 +285,24 @@ class Qwen3Attention:
             k_expanded = k_expanded.reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
             v_expanded = v.unsqueeze(2).expand(-1, -1, n_groups, -1, -1)
             v_expanded = v_expanded.reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
-            scale = 1.0 / (self.config.head_dim ** 0.5)
-            scores = torch.matmul(q.float(), k_expanded.float().transpose(-2, -1)) * scale
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()
-            scores = scores.masked_fill(mask, float('-inf'))
-            attn = torch.softmax(scores, dim=-1)
-            attn_out = torch.matmul(attn, v_expanded.float()).to(q.dtype)
+            if self.backend != Backend.CUDA:
+                scale = 1.0 / (self.config.head_dim ** 0.5)
+                scores = torch.matmul(q.float(), k_expanded.float().transpose(-2, -1)) * scale # [1，16，21，128] * 
+                mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()# [21，21]
+                scores = scores.masked_fill(mask, float('-inf')) # [1，16，21，21]
+                attn = torch.softmax(scores, dim=-1)
+                attn_out = torch.matmul(attn, v_expanded.float()).to(q.dtype)
+            else:
+                attn_out = self.cuda_kernels.attention_prefill(q.contiguous(), k_expanded.contiguous(), v_expanded.contiguous(), seq_len)  # prefill kernel 调度
             if k_cache is not None:
                 k_cache[:, :, :seq_len, :] = k
                 v_cache[:, :, :seq_len, :] = v
         else:
             k_cache[:, :, cache_position:cache_position+1, :] = k
             v_cache[:, :, cache_position:cache_position+1, :] = v
-            attn_out = self.attention_decode(q, k_cache, v_cache, cache_position + 1)
+            attn_out = self.attention_decode(q, k_cache, v_cache, cache_position + 1) # cuda or torch
 
-        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, -1)# [1，21，2048]
         output = torch.nn.functional.linear(attn_out, self.o_proj_weight)
         return output, k_cache, v_cache
 
@@ -353,7 +356,7 @@ class Qwen3Layer:
         hidden_states = self.rms_norm(hidden_states, self.input_layernorm_weight)
         hidden_states, k_cache, v_cache = self.self_attn.forward(
             hidden_states, cos, sin, position_ids, k_cache, v_cache, cache_position, is_prefill
-        )
+        )# Prefill调度
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.rms_norm(hidden_states, self.post_attention_layernorm_weight)
@@ -408,7 +411,7 @@ class Qwen3Model:
         new_kv_caches = []
         for i, layer in enumerate(self.layers):
             k_cache, v_cache = kv_caches[i]
-            hidden_states, k_cache, v_cache = layer.forward(hidden_states, self.cos, self.sin, position_ids, k_cache, v_cache, cache_position, is_prefill=False)
+            hidden_states, k_cache, v_cache = layer.forward(hidden_states, self.cos, self.sin, position_ids, k_cache, v_cache, cache_position, is_prefill=False)# decode调度
             new_kv_caches.append((k_cache, v_cache))
         hidden_states = self.rms_norm(hidden_states, self.final_norm_weight)
         logits = torch.nn.functional.linear(hidden_states, self.lm_head_weight)
@@ -471,13 +474,18 @@ def run_demo():
     cuda_model = Qwen3Model(hf_model, config, Backend.CUDA, cuda_kernels)
     print("Done!\n")
 
+    count=0
     while True:
         print("-" * 70)
-        prompt = input("Enter your question (or 'quit' to exit): ").strip()
-        if prompt.lower() in ['quit', 'exit', 'q']:
+        prompt="list all prime numbers within 100" # TODO: 规范化测试
+        count+=1
+        if(count==2):
             break
-        if not prompt:
-            continue
+        # prompt = input("Enter your question (or 'quit' to exit): ").strip()
+        # if prompt.lower() in ['quit', 'exit', 'q']:
+        #     break
+        # if not prompt:
+        #     continue
 
         # Format with chat template
         messages = [{"role": "user", "content": prompt}]
@@ -488,31 +496,31 @@ def run_demo():
         print(f"\nInput tokens: {input_ids.shape[1]}")
 
         # Generate with each backend
-        max_new_tokens = 100
+        max_new_tokens = 256
 
-        # Torch
-        print("\n" + "=" * 70)
-        print(" TORCH (Reference)")
-        print("=" * 70)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        torch_tokens = torch_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        torch_time = t1 - t0
-        print(f"[Generated {torch_tokens} tokens in {torch_time:.3f}s ({torch_tokens/torch_time:.1f} tok/s)]")
+        # # Torch
+        # print("\n" + "=" * 70)
+        # print(" TORCH (Reference)")
+        # print("=" * 70)
+        # torch.cuda.synchronize()
+        # t0 = time.perf_counter()
+        # torch_tokens = torch_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
+        # torch.cuda.synchronize()
+        # t1 = time.perf_counter()
+        # torch_time = t1 - t0
+        # print(f"[Generated {torch_tokens} tokens in {torch_time:.3f}s ({torch_tokens/torch_time:.1f} tok/s)]")
 
-        # Triton
-        print("\n" + "=" * 70)
-        print(" TRITON")
-        print("=" * 70)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        triton_tokens = triton_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        triton_time = t1 - t0
-        print(f"[Generated {triton_tokens} tokens in {triton_time:.3f}s ({triton_tokens/triton_time:.1f} tok/s)]")
+        # # Triton
+        # print("\n" + "=" * 70)
+        # print(" TRITON")
+        # print("=" * 70)
+        # torch.cuda.synchronize()
+        # t0 = time.perf_counter()
+        # triton_tokens = triton_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
+        # torch.cuda.synchronize()
+        # t1 = time.perf_counter()
+        # triton_time = t1 - t0
+        # print(f"[Generated {triton_tokens} tokens in {triton_time:.3f}s ({triton_tokens/triton_time:.1f} tok/s)]")
 
         # CUDA
         print("\n" + "=" * 70)
@@ -529,8 +537,8 @@ def run_demo():
         # Summary
         print("\n" + "-" * 70)
         print("Performance Summary:")
-        print(f"  Torch:  {torch_time:.3f}s ({torch_tokens/torch_time:.1f} tok/s)")
-        print(f"  Triton: {triton_time:.3f}s ({triton_tokens/triton_time:.1f} tok/s)")
+        # print(f"  Torch:  {torch_time:.3f}s ({torch_tokens/torch_time:.1f} tok/s)")
+        # print(f"  Triton: {triton_time:.3f}s ({triton_tokens/triton_time:.1f} tok/s)")
         print(f"  CUDA:   {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)")
         print()
 

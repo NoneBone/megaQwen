@@ -1,5 +1,3 @@
-#include "../include/attention_unit.cuh"
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math.h>
@@ -8,17 +6,6 @@
 
 using namespace nvcuda;
 static constexpr int WARP_SIZE = 32;
-
-// Explicit instantiation
-template __global__ void
-flash_attention_prefill_kernel<128, 16, 64, 4>(
-    const __nv_bfloat16*,
-    const __nv_bfloat16*,
-    const __nv_bfloat16*,
-    __nv_bfloat16*,
-    float*,
-    int, int, int, int, float
-);
 
 // FA2 Prefill Kernel  (WMMA Tensor Core, 4 warps, Bc=64, async double-buffer K/V)
 // Grid:  (ceil(S/Br), H_q, B)
@@ -372,11 +359,11 @@ __global__ void flash_attention_prefill_kernel(
 // =============================================================================
 // Launch wrapper
 // =============================================================================
-void launch_flash_attention_prefill(
-    const __nv_bfloat16* Q,
-    const __nv_bfloat16* K,
-    const __nv_bfloat16* V,
-    __nv_bfloat16*       O,
+extern "C" void launch_flash_attention_prefill(
+    const void* Q,
+    const void* K,
+    const void* V,
+    void*       O,
     int B, int S, int H_q, int H_kv, int head_dim,
     cudaStream_t stream,
     float*       lse
@@ -419,6 +406,21 @@ void launch_flash_attention_prefill(
     }
 
     kernel_fn<<<grid, block, smem_bytes, stream>>>(
-        Q, K, V, O, lse, B, S, H_q, H_kv, scale
+        (const __nv_bfloat16*)Q, 
+        (const __nv_bfloat16*)K, 
+        (const __nv_bfloat16*)V, 
+        (__nv_bfloat16*)O,
+         lse, B, S, H_q, H_kv, scale
     );
 }
+
+// Explicit instantiation
+template __global__ void
+flash_attention_prefill_kernel<128, 16, 64, 4>(
+    const __nv_bfloat16*,
+    const __nv_bfloat16*,
+    const __nv_bfloat16*,
+    __nv_bfloat16*,
+    float*,
+    int, int, int, int, float
+);
