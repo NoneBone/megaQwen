@@ -53,7 +53,7 @@ extern "C" void launch_attention_decode_v1(
     cudaStream_t stream
 );
 
-extern "C" void launch_attention_decode(
+extern "C" void launch_attention_decode_v2(
     const void* q,
     const void* k_cache,
     const void* v_cache,

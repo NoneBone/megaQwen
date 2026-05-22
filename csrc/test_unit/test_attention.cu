@@ -285,7 +285,7 @@ static bool run_decode_test(
     const char* name,
     int batch_size, int context_len, int H_q, int H_kv,
     int /*num_splits*/,               // kept for API compatibility – unused
-    AttentionDecodeLaunchFunc launch_func = launch_attention_decode,
+    AttentionDecodeLaunchFunc launch_func = launch_attention_decode_v1,
     int D = 128, int /*BLOCK_SIZE*/ = 16, float tol = 5e-3f
 ) {
     // -----------------------------------------------------------------------
@@ -535,7 +535,7 @@ static void run_prefill_benchmark(
 static void run_attention_decode_benchmark(
     const char* name,
     int batch_size, int context_len, int H_q, int H_kv,
-    AttentionDecodeLaunchFunc launch_func = launch_attention_decode,
+    AttentionDecodeLaunchFunc launch_func = launch_attention_decode_v1,
     int D = 128,
     int warmup = 10, int iters = 10
 ) {
@@ -656,7 +656,7 @@ static void run_attention_decode_benchmark(
 int main() {
     printf("=== Flash Attention kernel tests ===\n\n");
 
-    // ── Prefill tests ────────────────────────────────────────────────────────
+    // ───────────────────────── Prefill tests ─────────────────────────────────
     printf("--- Prefill (FlashAttention-2) ---\n");
     bool all_pass = true;
 
@@ -679,36 +679,7 @@ int main() {
     all_pass &= run_prefill_test(
         "Prefill B=1 S=256 H_q=16 H_kv=8 (4 KV tiles)",
         1, 256, 16, 8);
-
-    // ── Split-K decode tests ──────────────────────────────────────────────────
-    printf("\n--- Decode (Flash Decoding...) ---\n");
-    AttentionDecodeLaunchFunc launch_func = launch_attention_decode_v4;// v1, , v3 
     
-    all_pass &= run_decode_test(
-        "BF16 Decode batch_size=1 ctx=32  H_q=2  H_kv=1  splits=1",
-        1, 32, 2, 1, 1, launch_func
-    );
-
-    all_pass &= run_decode_test(
-    "BF16 SplitK batch_size=1 ctx=128  H_q=16 H_kv=8  splits=4",
-        1, 128, 16, 8, 1, launch_func);
-
-    all_pass &= run_decode_test(
-        "BF16 SplitK batch_size=2 ctx=64   H_q=4  H_kv=2  splits=4",
-        2, 64, 4, 2, 4, launch_func);
-
-    all_pass &= run_decode_test(
-        "BF16 SplitK batch_size=4 ctx=128  H_q=16 H_kv=8  splits=8",
-        4, 128, 16, 8, 8, launch_func);
-
-    all_pass &= run_decode_test(
-        "BF16 SplitK batch_size=1 ctx=2048 H_q=16 H_kv=8 splits=16",
-        1, 2048, 16, 8, 16, launch_func);
-        
-    // ── Summary ──────────────────────────────────────────────────────────────
-    printf("\n%s\n", all_pass ? "All tests PASSED." : "Some tests FAILED.");
-
-    // // ── Benchmarks ───────────────────────────────────────────────────────────
     printf("\n=== Prefill benchmarks (warmup=10, iters=10) ===\n");
     run_prefill_benchmark("Prefill B=1 S=2048 H_q=16 H_kv=8",  1, 2048, 16, 8);// draft
     run_prefill_benchmark("Prefill B=8 S=2048 H_q=16 H_kv=8",  8, 2048, 16, 8);
@@ -717,14 +688,59 @@ int main() {
     // run_prefill_benchmark("Prefill B=8 S=16384 H_q=16 H_kv=8",  8, 16384, 16, 8);
     // run_prefill_benchmark("Prefill B=8 S=32768 H_q=16 H_kv=8",  8, 32768, 16, 8);
 
-    printf("\n=== Decode benchmarks (warmup=10, iters=10) ===\n");
-    run_attention_decode_benchmark("SplitK  B=1   ctx=512   H_q=16 H_kv=8  S=8",   1,   512, 16, 8, launch_func);
-    run_attention_decode_benchmark("SplitK  B=1   ctx=2048  H_q=16 H_kv=8  S=16",  1,  2048, 16, 8, launch_func);
-    run_attention_decode_benchmark("SplitK  B=16  ctx=512   H_q=16 H_kv=8  S=8",  16,   512, 16, 8, launch_func);
-    run_attention_decode_benchmark("SplitK  B=16  ctx=2048  H_q=16 H_kv=8  S=16", 16,  2048, 16, 8, launch_func);
-    run_attention_decode_benchmark("SplitK  B=64  ctx=512   H_q=16 H_kv=8  S=8",  64,   512, 16, 8, launch_func);
-    run_attention_decode_benchmark("SplitK  B=64  ctx=2048  H_q=16 H_kv=8  S=16", 64,  2048, 16, 8, launch_func);
-    run_attention_decode_benchmark("SplitK  B=128 ctx=2048  H_q=16 H_kv=8  S=16",128,  2048, 16, 8, launch_func);
+    // ─────────────────────── Split-K decode tests ─────────────────────────────
+    printf("\n--- Decode (Flash Decoding...) ---\n");
+    AttentionDecodeLaunchFunc launch_func = launch_attention_decode_v1;// v1, v2, v3, v4
+    
+    all_pass &= run_decode_test(
+        "BF16 Decode batch_size=1 ctx=32  H_q=2  H_kv=1  splits=1",
+        1, 32, 2, 1, 1, launch_func
+    );
+
+    all_pass &= run_decode_test(
+    "BF16 Decode batch_size=1 ctx=128  H_q=16 H_kv=8  splits=4",
+        1, 128, 16, 8, 1, launch_func);
+
+    all_pass &= run_decode_test(
+        "BF16 Decode batch_size=2 ctx=64   H_q=4  H_kv=2  splits=4",
+        2, 64, 4, 2, 4, launch_func);
+
+    all_pass &= run_decode_test(
+        "BF16 Decode batch_size=4 ctx=128  H_q=16 H_kv=8  splits=8",
+        4, 128, 16, 8, 8, launch_func);
+
+    all_pass &= run_decode_test(
+        "BF16 Decode batch_size=1 ctx=2048 H_q=16 H_kv=8 splits=16",
+        1, 2048, 16, 8, 16, launch_func);
+        
+    // ─────────────────────────── Summary ─────────────────────────────────────
+    printf("\n%s\n", all_pass ? "All tests PASSED." : "Some tests FAILED.");
+
+    using LaunchFunc = decltype(&launch_attention_decode_v1);
+
+    struct Variant {
+        const char* name;
+        LaunchFunc func;
+    };
+
+    Variant variants[] = {
+        {"v1", launch_attention_decode_v1},
+        {"v2", launch_attention_decode_v2},
+        {"v3", launch_attention_decode_v3},
+        {"v4", launch_attention_decode_v4},
+    };
+
+    for (auto& v : variants) {
+        printf("\n=== Decode-%s benchmarks (warmup=10, iters=10) ===\n", v.name);
+
+        run_attention_decode_benchmark("Decode  B=1   ctx=512   H_q=16 H_kv=8 ", 1,   512, 16, 8, v.func);
+        run_attention_decode_benchmark("Decode  B=1   ctx=2048  H_q=16 H_kv=8 ", 1,  2048, 16, 8, v.func);
+        run_attention_decode_benchmark("Decode  B=16  ctx=512   H_q=16 H_kv=8 ", 16,  512, 16, 8, v.func);
+        run_attention_decode_benchmark("Decode  B=16  ctx=2048  H_q=16 H_kv=8 ", 16, 2048, 16, 8, v.func);
+        run_attention_decode_benchmark("Decode  B=64  ctx=512   H_q=16 H_kv=8 ", 64,  512, 16, 8, v.func);
+        run_attention_decode_benchmark("Decode  B=64  ctx=2048  H_q=16 H_kv=8 ", 64, 2048, 16, 8, v.func);
+        run_attention_decode_benchmark("Decode  B=128 ctx=2048  H_q=16 H_kv=8 ",128, 2048, 16, 8, v.func);
+    }
 
     return all_pass ? 0 : 1;
 }

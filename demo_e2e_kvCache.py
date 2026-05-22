@@ -1,5 +1,5 @@
 """
-End-to-end demo comparing Torch vs Triton vs CUDA backends for Qwen3-0.6B.
+Support KV cache and flashDecode-SplitK with CUDA backends for Qwen3-0.6B.
 Streams tokens to screen as they are generated.
 """
 
@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 from kernels import get_kernels
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
+from csrc.kvcache import KVCache
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -224,13 +224,23 @@ class Backend:
 # ============================================================================
 # Model Components (Backend-switchable)
 # ============================================================================
-
 class Qwen3Attention:
-    def __init__(self, layer_weights, config: Qwen3Config, layer_idx: int, backend: str, cuda_kernels=None):
+    def __init__(
+        self,
+        layer_weights,
+        config: Qwen3Config,
+        layer_idx: int,
+        backend: str,
+        cuda_kernels=None,
+        use_page_cache: bool = False,
+    ):
         self.config = config
         self.layer_idx = layer_idx
         self.backend = backend
         self.cuda_kernels = cuda_kernels
+        self.use_page_cache = use_page_cache
+
+        # Projection weights
         self.q_proj_weight = layer_weights["q_proj.weight"]
         self.k_proj_weight = layer_weights["k_proj.weight"]
         self.v_proj_weight = layer_weights["v_proj.weight"]
@@ -238,6 +248,9 @@ class Qwen3Attention:
         self.q_norm_weight = layer_weights["q_norm.weight"]
         self.k_norm_weight = layer_weights["k_norm.weight"]
 
+    # ------------------------------------------------------------------
+    # RMS‑Norm (unchanged)
+    # ------------------------------------------------------------------
     def rms_norm(self, x, weight):
         if self.backend == Backend.TORCH:
             return torch_rms_norm_sequential(x, weight, self.config.rms_norm_eps)
@@ -250,62 +263,136 @@ class Qwen3Attention:
         if self.backend == Backend.TORCH:
             return apply_rope_torch(q, k, cos, sin, position_ids)
         elif self.backend == Backend.TRITON:
-            return apply_rope_torch(q, k, cos, sin, position_ids)  # Use torch for triton too
+            return apply_rope_torch(q, k, cos, sin, position_ids)  # still torch for now
         else:  # CUDA
             pos = position_ids[0]
             cos_pos = cos[pos].contiguous()
             sin_pos = sin[pos].contiguous()
             return self.cuda_kernels.rope(q.contiguous(), k.contiguous(), cos_pos, sin_pos)
 
-    def attention_decode(self, q, k_cache, v_cache, cache_len):
+    # ------------------------------------------------------------------
+    # Decode kernel – now receives a KVCache manager.
+    # ------------------------------------------------------------------
+    def attention_decode(self, q: torch.Tensor, kv_cache: KVCache, cache_len: int) -> torch.Tensor:
         if self.backend == Backend.CUDA:
-            return self.cuda_kernels.attention_decode_v2(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # _v1, _v2, _v3
+            return self.cuda_kernels.attention_decode_v4(
+                q.contiguous(),
+                kv_cache.k_cache.contiguous(),
+                kv_cache.v_cache.contiguous(),
+                cache_len,
+                kv_cache.block_table,
+                kv_cache.seq_lens,
+                self.use_page_cache,
+            )
+            # return self.cuda_kernels.attention_decode(
+            #     q.contiguous(),
+            #     kv_cache.k_cache.contiguous(),
+            #     kv_cache.v_cache.contiguous(),
+            #     cache_len
+            # )
         else:
-            return attention_decode_torch(q, k_cache, v_cache, cache_len)
+            # Fallback to the pure‑torch implementation.
+            return attention_decode_torch(
+                q, kv_cache.k_cache, kv_cache.v_cache, cache_len
+            )
+    
+    # ------------------------------------------------------------------
+    # Forward (prefill | decode)
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_cache: KVCache,
+        cache_position: int = 0,
+        is_prefill: bool = True,
+    ):
+        batch, seq_len = hidden_states.shape[:2]
 
-    def forward(self, hidden_states, cos, sin, position_ids, k_cache=None, v_cache=None, cache_position=0, is_prefill=True):
-        batch, seq_len, _ = hidden_states.shape
+        # --------------------------------------------------------------
+        # Linear projections
+        # --------------------------------------------------------------
         q = torch.nn.functional.linear(hidden_states, self.q_proj_weight)
         k = torch.nn.functional.linear(hidden_states, self.k_proj_weight)
         v = torch.nn.functional.linear(hidden_states, self.v_proj_weight)
-        q = q.view(batch, seq_len, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2).contiguous()
-        k = k.view(batch, seq_len, self.config.num_key_value_heads, self.config.head_dim).transpose(1, 2).contiguous()
-        v = v.view(batch, seq_len, self.config.num_key_value_heads, self.config.head_dim).transpose(1, 2).contiguous()
 
-        # QK norm
+        # Reshape to [batch, heads, seq_len, head_dim]
+        q = q.view(batch, seq_len, self.config.num_attention_heads, self.config.head_dim).transpose(
+            1, 2
+        ).contiguous()
+        k = k.view(batch, seq_len, self.config.num_key_value_heads, self.config.head_dim).transpose(
+            1, 2
+        ).contiguous()
+        v = v.view(batch, seq_len, self.config.num_key_value_heads, self.config.head_dim).transpose(
+            1, 2
+        ).contiguous()
+
+        # --------------------------------------------------------------
+        # RMS‑Norm on Q and K
+        # --------------------------------------------------------------
         q = self.rms_norm(q.contiguous(), self.q_norm_weight)
         k = self.rms_norm(k.contiguous(), self.k_norm_weight)
 
-        # RoPE
+        # --------------------------------------------------------------
+        # Apply RoPE
+        # --------------------------------------------------------------
         q, k = self.apply_rope(q, k, cos, sin, position_ids)
 
+        # --------------------------------------------------------------
+        # Prefill (full‑sequence attention)
+        # --------------------------------------------------------------
         if is_prefill:
             n_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-            k_expanded = k.unsqueeze(2).expand(-1, -1, n_groups, -1, -1)
-            k_expanded = k_expanded.reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
-            v_expanded = v.unsqueeze(2).expand(-1, -1, n_groups, -1, -1)
-            v_expanded = v_expanded.reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
+            # Expand KV to match the number of query heads.
+            k_expanded = (
+                k.unsqueeze(2)
+                .expand(-1, -1, n_groups, -1, -1)
+                .reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
+            )
+            v_expanded = (
+                v.unsqueeze(2)
+                .expand(-1, -1, n_groups, -1, -1)
+                .reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
+            )
+
             if self.backend != Backend.CUDA:
                 scale = 1.0 / (self.config.head_dim ** 0.5)
-                scores = torch.matmul(q.float(), k_expanded.float().transpose(-2, -1)) * scale # [1，16，21，128] * 
-                mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()# [21，21]
-                scores = scores.masked_fill(mask, float('-inf')) # [1，16，21，21]
+                scores = torch.matmul(q.float(), k_expanded.float().transpose(-2, -1)) * scale
+                mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()
+                scores = scores.masked_fill(mask, float("-inf"))
                 attn = torch.softmax(scores, dim=-1)
                 attn_out = torch.matmul(attn, v_expanded.float()).to(q.dtype)
             else:
-                attn_out = self.cuda_kernels.attention_prefill(q.contiguous(), k_expanded.contiguous(), v_expanded.contiguous(), seq_len)  # prefill kernel 调度
-            if k_cache is not None:
-                k_cache[:, :, :seq_len, :] = k
-                v_cache[:, :, :seq_len, :] = v
+                # CUDA prefill kernel (already compiled in `cuda_kernels`).
+                attn_out = self.cuda_kernels.attention_prefill(
+                    q.contiguous(),
+                    k_expanded.contiguous(),
+                    v_expanded.contiguous(),
+                    seq_len,
+                )
+
+            # Store KV for later decode steps.
+            kv_cache.write_kv_prefill(k, v, seq_len)
+
+        # --------------------------------------------------------------
+        # Decode (single‑token attention)
+        # --------------------------------------------------------------
         else:
-            k_cache[:, :, cache_position:cache_position+1, :] = k
-            v_cache[:, :, cache_position:cache_position+1, :] = v
-            attn_out = self.attention_decode(q, k_cache, v_cache, cache_position + 1) # cuda or torch
+            # Append the new token to the cache.
+            kv_cache.write_kv(k, v, cache_position)
 
-        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, -1)# [1，21，2048]
+            # The kernel expects the *total* cache length after the write.
+            cache_len = cache_position + 1
+            attn_out = self.attention_decode(q, kv_cache, cache_len)
+
+        # --------------------------------------------------------------
+        # Output projection
+        # --------------------------------------------------------------
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
         output = torch.nn.functional.linear(attn_out, self.o_proj_weight)
-        return output, k_cache, v_cache
-
+        return output, kv_cache
 
 class Qwen3MLP:
     def __init__(self, layer_weights, config: Qwen3Config, backend: str, cuda_kernels=None):
@@ -330,19 +417,45 @@ class Qwen3MLP:
         hidden = self.silu_mul(gate, up)
         return torch.nn.functional.linear(hidden, self.down_proj_weight)
 
-
 class Qwen3Layer:
-    def __init__(self, layer_weights, config: Qwen3Config, layer_idx: int, backend: str, cuda_kernels=None):
+    def __init__(
+        self,
+        layer_weights,
+        config: Qwen3Config,
+        layer_idx: int,
+        backend: str,
+        cuda_kernels=None,
+        use_page_cache: bool = False,
+    ):
         self.config = config
         self.backend = backend
         self.cuda_kernels = cuda_kernels
         self.input_layernorm_weight = layer_weights["input_layernorm.weight"]
         self.post_attention_layernorm_weight = layer_weights["post_attention_layernorm.weight"]
-        attn_weights = {k.replace("self_attn.", ""): v for k, v in layer_weights.items() if "self_attn" in k}
-        mlp_weights = {k.replace("mlp.", ""): v for k, v in layer_weights.items() if "mlp" in k}
-        self.self_attn = Qwen3Attention(attn_weights, config, layer_idx, backend, cuda_kernels)
+
+        # Split the weight dicts.
+        attn_weights = {
+            k.replace("self_attn.", ""): v
+            for k, v in layer_weights.items()
+            if "self_attn" in k
+        }
+        mlp_weights = {
+            k.replace("mlp.", ""): v for k, v in layer_weights.items() if "mlp" in k
+        }
+
+        self.self_attn = Qwen3Attention(
+            attn_weights,
+            config,
+            layer_idx,
+            backend,
+            cuda_kernels,
+            use_page_cache,
+        )
         self.mlp = Qwen3MLP(mlp_weights, config, backend, cuda_kernels)
 
+    # ------------------------------------------------------------------
+    # RMS‑Norm (unchanged)
+    # ------------------------------------------------------------------
     def rms_norm(self, x, weight):
         if self.backend == Backend.TORCH:
             return torch_rms_norm_sequential(x, weight, self.config.rms_norm_eps)
@@ -351,36 +464,96 @@ class Qwen3Layer:
         else:  # CUDA
             return self.cuda_kernels.rms_norm(x.contiguous(), weight, self.config.rms_norm_eps)
 
-    def forward(self, hidden_states, cos, sin, position_ids, k_cache=None, v_cache=None, cache_position=0, is_prefill=True):
+    # ------------------------------------------------------------------
+    # Forward – now receives a KVCache for this layer.
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        hidden_states,
+        cos,
+        sin,
+        position_ids,
+        kv_cache: KVCache,
+        cache_position: int = 0,
+        is_prefill: bool = True,
+    ):
         residual = hidden_states
         hidden_states = self.rms_norm(hidden_states, self.input_layernorm_weight)
-        hidden_states, k_cache, v_cache = self.self_attn.forward(
-            hidden_states, cos, sin, position_ids, k_cache, v_cache, cache_position, is_prefill
-        )# Prefill调度
+
+        hidden_states, kv_cache = self.self_attn.forward(
+            hidden_states,
+            cos,
+            sin,
+            position_ids,
+            kv_cache,
+            cache_position,
+            is_prefill,
+        )
         hidden_states = residual + hidden_states
+
         residual = hidden_states
         hidden_states = self.rms_norm(hidden_states, self.post_attention_layernorm_weight)
         hidden_states = self.mlp.forward(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states, k_cache, v_cache
 
+        return hidden_states, kv_cache
 
 class Qwen3Model:
-    def __init__(self, hf_model, config: Qwen3Config, backend: str, cuda_kernels=None):
+    def __init__(
+        self,
+        hf_model,
+        config: Qwen3Config,
+        backend: str,
+        cuda_kernels=None,
+        use_page_cache: bool = False,
+        max_new_tokens: int = 256,
+        force_realloc_each_run: bool = False,
+    ):
         self.config = config
         self.backend = backend
         self.cuda_kernels = cuda_kernels
+        self.use_page_cache = use_page_cache
+        self.max_new_tokens = max_new_tokens
+        self.force_realloc_each_run = force_realloc_each_run
+
         self.device = next(hf_model.parameters()).device
         self.dtype = torch.bfloat16
         state_dict = hf_model.state_dict()
         self.embed_tokens = state_dict["model.embed_tokens.weight"]
         self.final_norm_weight = state_dict["model.norm.weight"]
         self.lm_head_weight = self.embed_tokens
+
+        # Build transformer layers.
         self.layers = []
         for i in range(config.num_hidden_layers):
-            layer_weights = {k.replace(f"model.layers.{i}.", ""): v for k, v in state_dict.items() if f"model.layers.{i}." in k}
-            self.layers.append(Qwen3Layer(layer_weights, config, i, backend, cuda_kernels))
-        self.cos, self.sin = precompute_rope_freqs(config.head_dim, config.max_position_embeddings, config.rope_theta, self.device)
+            layer_weights = {
+                k.replace(f"model.layers.{i}.", ""): v
+                for k, v in state_dict.items()
+                if f"model.layers.{i}." in k
+            }
+            self.layers.append(
+                Qwen3Layer(
+                    layer_weights,
+                    config,
+                    i,
+                    backend,
+                    cuda_kernels,
+                    use_page_cache,
+                )
+            )
+
+        # Pre‑compute RoPE frequencies.
+        self.cos, self.sin = precompute_rope_freqs(
+            config.head_dim,
+            config.max_position_embeddings,
+            config.rope_theta,
+            self.device,
+        )
+
+        # KV‑cache manager list – one per layer (filled lazily in `prefill`).
+        self.max_cache_len = config.max_position_embeddings + self.max_new_tokens
+        self.kv_caches: list[KVCache] = []
+        self._first_batch_size: int | None = None
 
     def rms_norm(self, x, weight):
         if self.backend == Backend.TORCH:
@@ -390,33 +563,97 @@ class Qwen3Model:
         else:  # CUDA
             return self.cuda_kernels.rms_norm(x.contiguous(), weight, self.config.rms_norm_eps)
 
-    def prefill(self, input_ids):
+    def _ensure_kv_caches(self, batch_size: int):
+        """
+        在第一次使用时根据 batch_size 完成 KVCache 的真实分配。
+        如果已经分配且 batch_size 与上一次相同，则直接复用。
+        如果 batch_size 变化或强制重新分配，则重新创建。
+        """
+        if self.kv_caches and not self.force_realloc_each_run:
+            # 已经有缓存，检查 batch 是否匹配
+            if batch_size == self._first_batch_size:
+                # 只需要把所有缓存 reset 即可
+                for kv in self.kv_caches:
+                    kv.reset()
+                return
+            else:
+                # batch 改变，需要重新分配
+                self.kv_caches = []
+
+        # ------------------- 真正分配 -------------------
+        self.kv_caches = []
+        for _ in self.layers:
+            kv = KVCache(
+                batch_size=batch_size,
+                num_kv_heads=self.config.num_key_value_heads,
+                head_dim=self.config.head_dim,
+                max_cache_len=self.max_cache_len,
+                block_size=16,               # 与原实现保持一致
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self.kv_caches.append(kv)
+
+        self._first_batch_size = batch_size
+
+    # ------------------------------------------------------------------
+    # Prefill – allocate a KVCache for each layer and run the forward pass.
+    # ------------------------------------------------------------------
+    def prefill(self, input_ids: torch.Tensor):
         batch, seq_len = input_ids.shape
+
+        # 确保 KVCache 已经分配（第一次调用时会创建）
+        self._ensure_kv_caches(batch)
+
         hidden_states = torch.nn.functional.embedding(input_ids, self.embed_tokens)
         position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0)
-        kv_caches = []
-        max_cache_len = seq_len + 512
-        for layer in self.layers:
-            k_cache = torch.zeros(batch, self.config.num_key_value_heads, max_cache_len, self.config.head_dim, device=self.device, dtype=self.dtype)
-            v_cache = torch.zeros(batch, self.config.num_key_value_heads, max_cache_len, self.config.head_dim, device=self.device, dtype=self.dtype)
-            hidden_states, k_cache, v_cache = layer.forward(hidden_states, self.cos, self.sin, position_ids, k_cache, v_cache, 0, is_prefill=True)
-            kv_caches.append((k_cache, v_cache))
+
+        # 这里不再重新创建 KVCache，而是直接使用已经分配好的缓存
+        # 每层的 KVCache 已经在 _ensure_kv_caches 中 reset()，所以是“空”的状态
+        for layer, kv_cache in zip(self.layers, self.kv_caches):
+            hidden_states, _ = layer.forward(
+                hidden_states,
+                self.cos,
+                self.sin,
+                position_ids,
+                kv_cache,
+                cache_position=0,
+                is_prefill=True,
+            )
+            # layer.forward 已经在内部调用 kv_cache.write_kv_prefill(k, v, seq_len)
+
         hidden_states = self.rms_norm(hidden_states, self.final_norm_weight)
         logits = torch.nn.functional.linear(hidden_states, self.lm_head_weight)
-        return logits, kv_caches, seq_len
+        # 返回的 kv_caches 仍然是同一批对象的引用，外部可以继续使用
+        return logits, self.kv_caches, seq_len
 
-    def decode_step(self, input_id, kv_caches, cache_position):
+    # ------------------------------------------------------------------
+    # Decode a single token.
+    # ------------------------------------------------------------------
+    def decode_step(self, input_id: torch.Tensor, kv_caches: list[KVCache], cache_position: int):
         hidden_states = torch.nn.functional.embedding(input_id, self.embed_tokens)
         position_ids = torch.tensor([[cache_position]], device=self.device)
+
         new_kv_caches = []
-        for i, layer in enumerate(self.layers):
-            k_cache, v_cache = kv_caches[i]
-            hidden_states, k_cache, v_cache = layer.forward(hidden_states, self.cos, self.sin, position_ids, k_cache, v_cache, cache_position, is_prefill=False)# decode调度
-            new_kv_caches.append((k_cache, v_cache))
+        for layer, kv_cache in zip(self.layers, kv_caches):
+            hidden_states, kv_cache = layer.forward(
+                hidden_states,
+                self.cos,
+                self.sin,
+                position_ids,
+                kv_cache,
+                cache_position,
+                is_prefill=False,
+            )
+            new_kv_caches.append(kv_cache)
+
         hidden_states = self.rms_norm(hidden_states, self.final_norm_weight)
         logits = torch.nn.functional.linear(hidden_states, self.lm_head_weight)
         return logits, new_kv_caches
 
+    # ------------------------------------------------------------------
+    # Streaming generation (unchanged API).
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def generate_streaming(self, input_ids, tokenizer, max_new_tokens=100):
         """Generate tokens with streaming output."""
@@ -426,119 +663,107 @@ class Qwen3Model:
 
         tokens_generated = 0
         while tokens_generated < max_new_tokens:
-            # Decode token and print
             token_str = tokenizer.decode(next_token[0], skip_special_tokens=True)
             print(token_str, end="", flush=True)
 
-            # Check for EOS
-            if next_token.item() == 151645:
+            if next_token.item() == 151645:  # EOS token id for Qwen‑3‑0.6B
                 break
 
-            # Generate next token
-            logits, kv_caches = self.decode_step(next_token, kv_caches, cache_len + tokens_generated)
+            logits, kv_caches = self.decode_step(
+                next_token, kv_caches, cache_len + tokens_generated
+            )
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             tokens_generated += 1
 
-        print()  # Newline after generation
+        print()
         return tokens_generated
-
 
 # ============================================================================
 # Main Demo
 # ============================================================================
-
 def run_demo():
     print("=" * 70)
     print(" End-to-End Demo: Torch vs Triton vs CUDA")
     print("=" * 70)
 
-    # Load model
+    # ------------------------------------------------------------------
+    # Load the model and tokenizer.
+    # ------------------------------------------------------------------
     print("\nLoading Qwen3-0.6B model...")
     model_name = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="cuda")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16, device_map="cuda"
+    )
     hf_model.eval()
 
-    # Compile CUDA kernels
+    # ------------------------------------------------------------------
+    # Compile CUDA kernels (only needed for the CUDA backend).
+    # ------------------------------------------------------------------
     print("Compiling CUDA kernels...")
     cuda_kernels = get_kernels()
     print("Done!\n")
 
-    # Create config
+    # ------------------------------------------------------------------
+    # Configuration & backend models.
+    # ------------------------------------------------------------------
     config = Qwen3Config()
-
-    # Create models for each backend
+    max_new_tokens = 256
     print("Creating backend models...")
-    torch_model = Qwen3Model(hf_model, config, Backend.TORCH)
-    triton_model = Qwen3Model(hf_model, config, Backend.TRITON)
-    cuda_model = Qwen3Model(hf_model, config, Backend.CUDA, cuda_kernels)
+    torch_model = Qwen3Model(hf_model, config, Backend.TORCH, max_new_tokens=max_new_tokens)
+    triton_model = Qwen3Model(hf_model, config, Backend.TRITON, max_new_tokens=max_new_tokens)
+    cuda_model = Qwen3Model(
+        hf_model,
+        config,
+        Backend.CUDA,
+        cuda_kernels,
+        use_page_cache=True,
+        max_new_tokens=max_new_tokens,
+    )
     print("Done!\n")
 
-    count=0
+    count = 0
     while True:
         print("-" * 70)
-        prompt="list all prime numbers within 100" # TODO: 规范化测试
-        count+=1
-        if(count==2):
+        prompt = "list all prime numbers within 100"
+        count += 1
+        if count == 2:
             break
-        # prompt = input("Enter your question (or 'quit' to exit): ").strip()
-        # if prompt.lower() in ['quit', 'exit', 'q']:
-        #     break
-        # if not prompt:
-        #     continue
 
-        # Format with chat template
         messages = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
         inputs = tokenizer(text, return_tensors="pt").to("cuda")
         input_ids = inputs["input_ids"]
 
         print(f"\nInput tokens: {input_ids.shape[1]}")
 
-        # Generate with each backend
         max_new_tokens = 256
 
-        # # Torch
-        # print("\n" + "=" * 70)
-        # print(" TORCH (Reference)")
-        # print("=" * 70)
-        # torch.cuda.synchronize()
-        # t0 = time.perf_counter()
-        # torch_tokens = torch_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
-        # torch.cuda.synchronize()
-        # t1 = time.perf_counter()
-        # torch_time = t1 - t0
-        # print(f"[Generated {torch_tokens} tokens in {torch_time:.3f}s ({torch_tokens/torch_time:.1f} tok/s)]")
-
-        # # Triton
-        # print("\n" + "=" * 70)
-        # print(" TRITON")
-        # print("=" * 70)
-        # torch.cuda.synchronize()
-        # t0 = time.perf_counter()
-        # triton_tokens = triton_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
-        # torch.cuda.synchronize()
-        # t1 = time.perf_counter()
-        # triton_time = t1 - t0
-        # print(f"[Generated {triton_tokens} tokens in {triton_time:.3f}s ({triton_tokens/triton_time:.1f} tok/s)]")
-
-        # CUDA
+        # ------------------------------------------------------------------
+        # CUDA backend (the only one that uses the paged KV cache now).
+        # ------------------------------------------------------------------
         print("\n" + "=" * 70)
         print(" CUDA")
         print("=" * 70)
         torch.cuda.synchronize()
+        cuda_tokens = cuda_model.generate_streaming(
+            input_ids.clone(), tokenizer, max_new_tokens
+        )
         t0 = time.perf_counter()
-        cuda_tokens = cuda_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
+        cuda_tokens = cuda_model.generate_streaming(
+            input_ids.clone(), tokenizer, max_new_tokens
+        )
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         cuda_time = t1 - t0
-        print(f"[Generated {cuda_tokens} tokens in {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)]")
+        print(
+            f"[Generated {cuda_tokens} tokens in {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)]"
+        )
 
-        # Summary
         print("\n" + "-" * 70)
         print("Performance Summary:")
-        # print(f"  Torch:  {torch_time:.3f}s ({torch_tokens/torch_time:.1f} tok/s)")
-        # print(f"  Triton: {triton_time:.3f}s ({triton_tokens/triton_time:.1f} tok/s)")
         print(f"  CUDA:   {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)")
         print()
 
