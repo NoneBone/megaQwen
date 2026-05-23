@@ -5,6 +5,7 @@ Streams tokens to screen as they are generated.
 
 import time
 from dataclasses import dataclass
+from typing import Tuple, Dict, List
 
 import torch
 import triton
@@ -28,6 +29,69 @@ class Qwen3Config:
     rms_norm_eps: float = 1e-6
     rope_theta: float = 1000000.0
     max_position_embeddings: int = 40960
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities (new)
+# ---------------------------------------------------------------------------
+
+def make_input_ids(tokenizer: AutoTokenizer, length: int, device: torch.device) -> torch.Tensor:
+    """
+    Build a dummy ``input_ids`` tensor that contains exactly ``length`` tokens.
+    We simply repeat the token for the word ``"Hello"`` – it is guaranteed to be
+    in the vocab of Qwen‑3‑0.6B.
+    """
+    token = tokenizer.encode("Hello", add_special_tokens=False)[0]
+    return torch.full((1, length), token, dtype=torch.long, device=device)
+
+
+def benchmark_model(
+    model,                     # Qwen3Model instance
+    input_ids: torch.Tensor,   # prompt tensor
+    max_new_tokens: int,       # number of decode steps
+) -> Tuple[int, Dict[str, float]]:
+    """
+    Run a full generation (prefill + decode) and return:
+        * total generated tokens (including prompt)
+        * a dict with the detailed timings:
+            - prompt_tokens
+            - prefill_time (ms)
+            - prefill_speed (tok/s)
+            - decode_steps
+            - decode_time (ms)
+            - decode_speed (tok/s)
+    """
+    # ---------- Prefill ----------
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    logits, kv_caches, prompt_len = model.prefill(input_ids)
+    torch.cuda.synchronize()
+    prefill_time = (time.perf_counter() - t0) * 1e3          # ms
+
+    # ---------- Decode ----------
+    next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    decode_steps = max_new_tokens
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for step in range(decode_steps):
+        logits, kv_caches = model.decode_step(
+            next_token, kv_caches, prompt_len + step
+        )
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    torch.cuda.synchronize()
+    decode_time = (time.perf_counter() - t0) * 1e3          # ms
+
+    # ---------- Stats ----------
+    stats = {
+        "prompt_tokens": prompt_len,
+        "prefill_time_ms": prefill_time,
+        "prefill_speed_toks": (prompt_len / (prefill_time / 1e3)),
+        "decode_steps": decode_steps,
+        "decode_time_ms": decode_time,
+        "decode_speed_toks": (decode_steps / (decode_time / 1e3)),
+    }
+    total_generated = prompt_len + decode_steps
+    return total_generated, stats
 
 
 # ============================================================================
@@ -259,7 +323,7 @@ class Qwen3Attention:
 
     def attention_decode(self, q, k_cache, v_cache, cache_len):
         if self.backend == Backend.CUDA:
-            return self.cuda_kernels.attention_decode_v2(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # _v1, _v2, _v3
+            return self.cuda_kernels.attention_decode_v3(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # decode kernel调度
         else:
             return attention_decode_torch(q, k_cache, v_cache, cache_len)
 
@@ -411,7 +475,7 @@ class Qwen3Model:
         new_kv_caches = []
         for i, layer in enumerate(self.layers):
             k_cache, v_cache = kv_caches[i]
-            hidden_states, k_cache, v_cache = layer.forward(hidden_states, self.cos, self.sin, position_ids, k_cache, v_cache, cache_position, is_prefill=False)# decode调度
+            hidden_states, k_cache, v_cache = layer.forward(hidden_states, self.cos, self.sin, position_ids, k_cache, v_cache, cache_position, is_prefill=False)# decode 调度
             new_kv_caches.append((k_cache, v_cache))
         hidden_states = self.rms_norm(hidden_states, self.final_norm_weight)
         logits = torch.nn.functional.linear(hidden_states, self.lm_head_weight)
@@ -449,14 +513,16 @@ class Qwen3Model:
 
 def run_demo():
     print("=" * 70)
-    print(" End-to-End Demo: Torch vs Triton vs CUDA")
+    print(" End-to-End Demo: Torch vs Triton vs CUDA (with detailed timing)")
     print("=" * 70)
 
     # Load model
     print("\nLoading Qwen3-0.6B model...")
     model_name = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, device_map="cuda")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16, device_map="cuda"
+    )
     hf_model.eval()
 
     # Compile CUDA kernels
@@ -464,83 +530,52 @@ def run_demo():
     cuda_kernels = get_kernels()
     print("Done!\n")
 
-    # Create config
+    # Create config & backend models (only CUDA is exercised in the demo)
     config = Qwen3Config()
-
-    # Create models for each backend
-    print("Creating backend models...")
     torch_model = Qwen3Model(hf_model, config, Backend.TORCH)
     triton_model = Qwen3Model(hf_model, config, Backend.TRITON)
     cuda_model = Qwen3Model(hf_model, config, Backend.CUDA, cuda_kernels)
-    print("Done!\n")
+    
 
-    count=0
-    while True:
-        print("-" * 70)
-        prompt="list all prime numbers within 100" # TODO: 规范化测试
-        count+=1
-        if(count==2):
-            break
-        # prompt = input("Enter your question (or 'quit' to exit): ").strip()
-        # if prompt.lower() in ['quit', 'exit', 'q']:
-        #     break
-        # if not prompt:
-        #     continue
+    # -----------------------------------------------------------------------
+    # Test scenarios (Prompt Tokens, Decode Steps, Total Context, Dominant Phase)
+    # -----------------------------------------------------------------------
+    scenarios = [
+        # name,   prompt_len, decode_steps, total_context, dominant
+        ("Short",   20,   50,   70,   "decode"),
+        ("Medium", 256,  128,  356,   "balanced"),
+        ("Long",  1024,  156, 1224,   "prefill"),
+        ("Very Long1", 4096, 1024, 4396, "prefill+cache"),
+        ("Very Long2", 8192, 2048, 4396, "prefill-8k"),
+        # ("Very Long3", 16384, 300, 4396, "OOM"),
+        # ("Very Long4", 32768, 300, 4396, "OOM"),
+    ]
+    mod = cuda_model
+    # for mod in (cuda_model):# triton_model, torch_model
+    if mod:
+        for name, prompt_len, decode_steps, total_ctx, dominant in scenarios:
+            print("-" * 70)
+            print(f"Scenario: {name} (prompt={prompt_len}, decode={decode_steps}) – dominant: {dominant}")
 
-        # Format with chat template
-        messages = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        inputs = tokenizer(text, return_tensors="pt").to("cuda")
-        input_ids = inputs["input_ids"]
+            # Build a dummy prompt of the requested length
+            input_ids = make_input_ids(tokenizer, prompt_len, torch.device("cuda"))
 
-        print(f"\nInput tokens: {input_ids.shape[1]}")
+            # Run benchmark (CUDA backend)
+            torch.cuda.synchronize()
+            _, stats = benchmark_model(mod, input_ids, decode_steps)
 
-        # Generate with each backend
-        max_new_tokens = 256
+            # Pretty‑print the required fields
+            print(f"Prompt tokens : {stats['prompt_tokens']}")
+            print(f"Prefill time  : {stats['prefill_time_ms']:.1f} ms")
+            print(f"Prefill speed : {stats['prefill_speed_toks']:.0f} tokens/s")
+            print(f"Decode steps  : {stats['decode_steps']}")
+            print(f"Decode time   : {stats['decode_time_ms']:.1f} ms")
+            print(f"Decode speed  : {stats['decode_speed_toks']:.0f} tokens/s")
+            print()
 
-        # # Torch
-        # print("\n" + "=" * 70)
-        # print(" TORCH (Reference)")
-        # print("=" * 70)
-        # torch.cuda.synchronize()
-        # t0 = time.perf_counter()
-        # torch_tokens = torch_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
-        # torch.cuda.synchronize()
-        # t1 = time.perf_counter()
-        # torch_time = t1 - t0
-        # print(f"[Generated {torch_tokens} tokens in {torch_time:.3f}s ({torch_tokens/torch_time:.1f} tok/s)]")
-
-        # # Triton
-        # print("\n" + "=" * 70)
-        # print(" TRITON")
-        # print("=" * 70)
-        # torch.cuda.synchronize()
-        # t0 = time.perf_counter()
-        # triton_tokens = triton_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
-        # torch.cuda.synchronize()
-        # t1 = time.perf_counter()
-        # triton_time = t1 - t0
-        # print(f"[Generated {triton_tokens} tokens in {triton_time:.3f}s ({triton_tokens/triton_time:.1f} tok/s)]")
-
-        # CUDA
-        print("\n" + "=" * 70)
-        print(" CUDA")
-        print("=" * 70)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        cuda_tokens = cuda_model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        cuda_time = t1 - t0
-        print(f"[Generated {cuda_tokens} tokens in {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)]")
-
-        # Summary
-        print("\n" + "-" * 70)
-        print("Performance Summary:")
-        # print(f"  Torch:  {torch_time:.3f}s ({torch_tokens/torch_time:.1f} tok/s)")
-        # print(f"  Triton: {triton_time:.3f}s ({triton_tokens/triton_time:.1f} tok/s)")
-        print(f"  CUDA:   {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)")
-        print()
+    print("=" * 70)
+    print("All scenarios completed.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
