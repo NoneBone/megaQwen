@@ -17,6 +17,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Configuration
 # ============================================================================
 
+class Attn_method:
+    use_flash_attn = 1
+    PREFILL = {"v1":"naive","v2":"cuda","v3":"flash"}
+    DECODE = {"v1":"v1","v2":"best","v3":"largeBatch", "v4":"spport in the ..kvCache.py"}
+
 @dataclass
 class Qwen3Config:
     vocab_size: int = 151936
@@ -89,6 +94,8 @@ def benchmark_model(
         "decode_steps": decode_steps,
         "decode_time_ms": decode_time,
         "decode_speed_toks": (decode_steps / (decode_time / 1e3)),
+        "total_time_ms": (prefill_time+decode_time),
+        "total_speed_toks": ((prompt_len + decode_steps) / ((prefill_time+decode_time) / 1e3)),
     }
     total_generated = prompt_len + decode_steps
     return total_generated, stats
@@ -284,7 +291,6 @@ class Backend:
     TRITON = "triton"
     CUDA = "cuda"
 
-
 # ============================================================================
 # Model Components (Backend-switchable)
 # ============================================================================
@@ -322,10 +328,27 @@ class Qwen3Attention:
             return self.cuda_kernels.rope(q.contiguous(), k.contiguous(), cos_pos, sin_pos)
 
     def attention_decode(self, q, k_cache, v_cache, cache_len):
-        if self.backend == Backend.CUDA:
-            return self.cuda_kernels.attention_decode_v3(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # decode kernel调度
+        if Attn_method.use_flash_attn:
+            q_fa = q.permute(0, 2, 1, 3).contiguous()
+            k_fa = k_cache.permute(0, 2, 1, 3).contiguous()
+            v_fa = v_cache.permute(0, 2, 1, 3).contiguous()
+
+            from flash_attn import flash_attn_with_kvcache
+            o_fa = flash_attn_with_kvcache(
+                q_fa,
+                k_fa,
+                v_fa,
+                cache_seqlens=cache_len, block_table=None, 
+                softmax_scale=1.0 / (self.config.head_dim ** 0.5), causal=False)
+            o = o_fa.permute(0, 2, 1, 3).contiguous()
+            return o
         else:
-            return attention_decode_torch(q, k_cache, v_cache, cache_len)
+            if self.backend == Backend.CUDA:
+                o = self.cuda_kernels.attention_decode_v2(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # decode kernel调度
+                return o
+            else:
+                o = attention_decode_torch(q, k_cache, v_cache, cache_len)
+                return o
 
     def forward(self, hidden_states, cos, sin, position_ids, k_cache=None, v_cache=None, cache_position=0, is_prefill=True):
         batch, seq_len, _ = hidden_states.shape
@@ -342,22 +365,54 @@ class Qwen3Attention:
 
         # RoPE
         q, k = self.apply_rope(q, k, cos, sin, position_ids)
-
         if is_prefill:
-            n_groups = self.config.num_attention_heads // self.config.num_key_value_heads
-            k_expanded = k.unsqueeze(2).expand(-1, -1, n_groups, -1, -1)
-            k_expanded = k_expanded.reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
-            v_expanded = v.unsqueeze(2).expand(-1, -1, n_groups, -1, -1)
-            v_expanded = v_expanded.reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
-            if self.backend != Backend.CUDA:
-                scale = 1.0 / (self.config.head_dim ** 0.5)
-                scores = torch.matmul(q.float(), k_expanded.float().transpose(-2, -1)) * scale # [1，16，21，128] * 
-                mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()# [21，21]
-                scores = scores.masked_fill(mask, float('-inf')) # [1，16，21，21]
-                attn = torch.softmax(scores, dim=-1)
-                attn_out = torch.matmul(attn, v_expanded.float()).to(q.dtype)
+            if Attn_method.use_flash_attn:
+                from flash_attn import flash_attn_func, flash_attn_varlen_func
+                batch, n_head_q, seq_len_q, _ = q.shape
+                _, n_head_k, seq_len_k, _ = k.shape
+                _, n_head_v, seq_len_v, _ = v.shape
+                if 1:# NOTE: 用于 batch 变长序列处理 
+                    q_ = q.permute(0, 2, 1, 3)[0]
+                    k_ = k.permute(0, 2, 1, 3)[0]
+                    v_ = v.permute(0, 2, 1, 3)[0]
+
+                    attn_out = flash_attn_varlen_func(
+                        q_,
+                        k_,
+                        v_,
+                        max_seqlen_q=seq_len_q,
+                        cu_seqlens_q=torch.tensor([0, seq_len_q], dtype=torch.int32, device="cuda"),# 20
+                        max_seqlen_k=seq_len_k,
+                        cu_seqlens_k=torch.tensor([0, seq_len_k], dtype=torch.int32, device="cuda"),# 20
+                        causal=True,
+                        block_table=None,
+                    )
+                else:# NOTE: 用于 batch 定长序列处理
+                    q_ = q.permute(0, 2, 1, 3)
+                    k_ = k.permute(0, 2, 1, 3)
+                    v_ = v.permute(0, 2, 1, 3)
+                    attn_out = flash_attn_func(
+                        q_, k_, v_,
+                        causal=True
+                    )
+                attn_out = attn_out.view(batch, seq_len_q, n_head_q, self.config.head_dim)   # (batch, seq_len_q, n_head_q, head_dim)
+                attn_out = attn_out.permute(0, 2, 1, 3).contiguous()
+                
             else:
-                attn_out = self.cuda_kernels.attention_prefill(q.contiguous(), k_expanded.contiguous(), v_expanded.contiguous(), seq_len)  # prefill kernel 调度
+                n_groups = self.config.num_attention_heads // self.config.num_key_value_heads
+                k_expanded = k.unsqueeze(2).expand(-1, -1, n_groups, -1, -1)
+                k_expanded = k_expanded.reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
+                v_expanded = v.unsqueeze(2).expand(-1, -1, n_groups, -1, -1)
+                v_expanded = v_expanded.reshape(batch, self.config.num_attention_heads, seq_len, self.config.head_dim)
+                if self.backend != Backend.CUDA:
+                    scale = 1.0 / (self.config.head_dim ** 0.5)
+                    scores = torch.matmul(q.float(), k_expanded.float().transpose(-2, -1)) * scale # [1，16，21，128] * 
+                    mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1).bool()# [21，21]
+                    scores = scores.masked_fill(mask, float('-inf')) # [1，16，21，21]
+                    attn = torch.softmax(scores, dim=-1)
+                    attn_out = torch.matmul(attn, v_expanded.float()).to(q.dtype)
+                else:
+                    attn_out = self.cuda_kernels.attention_prefill(q.contiguous(), k_expanded.contiguous(), v_expanded.contiguous(), seq_len)  # prefill kernel 调度
             if k_cache is not None:
                 k_cache[:, :, :seq_len, :] = k
                 v_cache[:, :, :seq_len, :] = v
@@ -506,11 +561,46 @@ class Qwen3Model:
         print()  # Newline after generation
         return tokens_generated
 
+def fast_answer_test(tokenizer, model):
+    # out test
+    prompt="list all prime numbers within 100"
+    # prompt = input("Enter your question (or 'quit' to exit): ").strip()
+    # if prompt.lower() in ['quit', 'exit', 'q']:
+    #     break
+    # if not prompt:
+    #     continue
+
+    # Format with chat template
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    inputs = tokenizer(text, return_tensors="pt").to("cuda")
+    input_ids = inputs["input_ids"]
+
+    print(f"\nInput tokens: {input_ids.shape[1]}")
+
+    # Generate with each backend
+    max_new_tokens = 256
+    # CUDA
+    print("\n" + "=" * 70)
+    print(" CUDA")
+    print("=" * 70)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    cuda_tokens = model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    cuda_time = t1 - t0
+    print(f"[Generated {cuda_tokens} tokens in {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)]")
+
+    # Summary
+    print("\n" + "-" * 70)
+    print("Performance Summary:")
+    print(f"  XXXX:   {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)")
+    print()
 
 # ============================================================================
 # Main Demo
 # ============================================================================
-
 def run_demo():
     print("=" * 70)
     print(" End-to-End Demo: Torch vs Triton vs CUDA (with detailed timing)")
@@ -553,6 +643,7 @@ def run_demo():
     mod = cuda_model
     # for mod in (cuda_model):# triton_model, torch_model
     if mod:
+        fast_answer_test(tokenizer, mod)
         for name, prompt_len, decode_steps, total_ctx, dominant in scenarios:
             print("-" * 70)
             print(f"Scenario: {name} (prompt={prompt_len}, decode={decode_steps}) – dominant: {dominant}")
@@ -571,6 +662,10 @@ def run_demo():
             print(f"Decode steps  : {stats['decode_steps']}")
             print(f"Decode time   : {stats['decode_time_ms']:.1f} ms")
             print(f"Decode speed  : {stats['decode_speed_toks']:.0f} tokens/s")
+            print(f"Total time    : {stats['total_time_ms']:.1f} ms")
+            print(f"Total speed   : {stats['total_speed_toks']:.0f} tokens/s")
+
+            # Print a new line for the next ste
             print()
 
     print("=" * 70)
