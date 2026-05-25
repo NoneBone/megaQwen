@@ -18,9 +18,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ============================================================================
 
 class Attn_method:
-    use_flash_attn = 1
+    use_flash_attn = 0
     PREFILL = {"v1":"naive","v2":"cuda","v3":"flash"}
-    DECODE = {"v1":"v1","v2":"best","v3":"largeBatch", "v4":"spport in the ..kvCache.py"}
+    DECODE = {"v1":"v1","v2":"best","v3":"largeBatch", "v4":"splitk", "paged_splitk":"paged"}
 
 @dataclass
 class Qwen3Config:
@@ -344,7 +344,7 @@ class Qwen3Attention:
             return o
         else:
             if self.backend == Backend.CUDA:
-                o = self.cuda_kernels.attention_decode_v2(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # decode kernel调度
+                o = self.cuda_kernels.attention_decode_v4(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # decode kernel调度
                 return o
             else:
                 o = attention_decode_torch(q, k_cache, v_cache, cache_len)
@@ -475,7 +475,7 @@ class Qwen3Layer:
         hidden_states = self.rms_norm(hidden_states, self.input_layernorm_weight)
         hidden_states, k_cache, v_cache = self.self_attn.forward(
             hidden_states, cos, sin, position_ids, k_cache, v_cache, cache_position, is_prefill
-        )# Prefill调度
+        )# Prefill or Decode 调度
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.rms_norm(hidden_states, self.post_attention_layernorm_weight)

@@ -1,13 +1,24 @@
-
 #include <cuda_bf16.h>          // <-- added for bfloat16
 #include <cuda_runtime.h>
 #include <math.h>
 #include <mma.h>
 #include <cstdio>
+#include <type_traits>
 
 using namespace nvcuda;
+
+#define CUDA_CHECK_(call)                                                      \
+do {                                                                      \
+    cudaError_t err = (call);                                             \
+    if (err != cudaSuccess) {                                             \
+        fprintf(stderr, "CUDA error at %s:%d — %s\n",                    \
+                __FILE__, __LINE__, cudaGetErrorString(err));             \
+        exit(EXIT_FAILURE);                                               \
+    }                                                                     \
+} while (0)
+
 template<int HEAD_DIM, int BLOCK_SIZE, int NUM_WARPS>
-__global__ void flash_decode_splitk_kernel(
+__global__ void flash_decode_paged_splitk_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k_cache,
     const __nv_bfloat16* __restrict__ v_cache,
@@ -19,6 +30,8 @@ __global__ void flash_decode_splitk_kernel(
     float scale,
     int max_blocks_per_seq,
     int H_q, int H_kv,
+    int head_dim,
+    long head_stride,               // <-- new argument: true stride (max_seq_len * head_dim)
     int num_splits
 ) {
     // -----------------------------------------------------------------
@@ -80,11 +93,9 @@ __global__ void flash_decode_splitk_kernel(
         const int logical_block = seq_block_table[blk];          // 0 … max_blocks_per_seq‑1
         // ----- compute the *global* offset of the first token of this block -----
         // layout: [batch, H_kv, max_seq_len, HEAD_DIM]   (head‑major)
-        // max_seq_len = max_blocks_per_seq * BLOCK_SIZE
-        const long max_seq_len = (long)max_blocks_per_seq * BLOCK_SIZE;
         const long block_base =
-            // batch‑head stride
-            ((long)seq_idx * H_kv + h_kv) * max_seq_len * HEAD_DIM
+            // batch‑head stride (uses the true stride of the KV cache)
+            ((long)seq_idx * H_kv + h_kv) * head_stride
             // block‑within‑sequence stride
             + (long)logical_block * BLOCK_SIZE * HEAD_DIM;
 
@@ -186,7 +197,7 @@ __global__ void flash_decode_splitk_kernel(
     }
 }
 template<int HEAD_DIM>
-__global__ void flash_decode_reduce_kernel(
+__global__ void flash_decode_paged_reduce_kernel(
     const float* __restrict__ partial_out,
     const float* __restrict__ partial_max,
     const float* __restrict__ partial_sum,
@@ -234,138 +245,141 @@ __global__ void flash_decode_reduce_kernel(
         out_ptr[e] = __float2bfloat16(acc[e] * inv);   // <-- changed
 }
 
-#define CUDA_CHECK(call)                                                      \
-    do {                                                                      \
-        cudaError_t err = (call);                                             \
-        if (err != cudaSuccess) {                                             \
-            fprintf(stderr, "CUDA error at %s:%d — %s\n",                    \
-                    __FILE__, __LINE__, cudaGetErrorString(err));             \
-            exit(EXIT_FAILURE);                                               \
-        }                                                                     \
-    } while (0)
-
-// Deprecated  version. Even though the unit test performance is excellent, 
-// the current integration test performance is not satisfactory because of the poor performance of the page attn system.
-extern "C" void launch_attention_decode_v4(
-    const void* q,               // [batch, n_q_heads, 1, head_dim]   (bfloat16)
-    const void* k_cache,         // [batch, n_kv_heads, max_seq_len, head_dim] (bfloat16, block‑major)
-    const void* v_cache,         // 同上
-    void* out,                   // [batch, n_q_heads, head_dim]   (bfloat16)
+extern "C" void launch_attention_decode_paged_splitk(
+    const void* q,
+    const void* k_cache,
+    const void* v_cache,
+    void* out,
     int batch_size,
-    int cache_len,               // 已经缓存的 token 数目 (= seq_len)
+    int cache_len,
     int n_q_heads,
     int n_kv_heads,
     int head_dim,
-    int max_seq_len,             // 与 k_cache/v_cache 第三维相同（这里不直接使用，只用于检查）
+    int max_seq_len_total,          // <-- renamed to avoid shadowing
     float scale,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int* d_block_tables,
+    const int* d_seq_lens,
+    bool use_page_cache
 ) {
     // ------------------------------------------------------------------
-    // 1. 基本指针转换
-    // ------------------------------------------------------------------
-    const __nv_bfloat16* d_q       = static_cast<const __nv_bfloat16*>(q);
-    const __nv_bfloat16* d_k_cache = static_cast<const __nv_bfloat16*>(k_cache);
-    const __nv_bfloat16* d_v_cache = static_cast<const __nv_bfloat16*>(v_cache);
-    __nv_bfloat16*       d_out     = static_cast<__nv_bfloat16*>(out);
-
-    // ------------------------------------------------------------------
-    // 2. 常量配置（与 v3 中保持一致）
+    // 1.  Basic constants
     // ------------------------------------------------------------------
     constexpr int BLOCK_SIZE = 16;   // KV‑cache block size
     constexpr int NUM_WARPS  = 8;    // 8 warps = 256 threads per CTA
-    const int num_splits = 2;        // 可自行调节，2 在大多数长度下效果不错
+    const int num_splits = 2;        // can be tuned
 
     // ------------------------------------------------------------------
-    // 3. 派生尺寸
+    // 2.  Derived sizes
     // ------------------------------------------------------------------
     const int max_blocks_per_seq = (cache_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    // partial buffers: [batch, n_q_heads, num_splits, head_dim] (float)
-    const size_t ws_out = static_cast<size_t>(batch_size) * n_q_heads * num_splits * head_dim;
-    const size_t ws_ms  = static_cast<size_t>(batch_size) * n_q_heads * num_splits; // max / sum
+    // The *actual* stride (tokens per head) of the KV cache – comes from the
+    // tensor shape supplied by the Python wrapper.
+    const long head_stride = static_cast<long>(max_seq_len_total) * head_dim;
 
     // ------------------------------------------------------------------
-    // 4. 申请临时显存
+    // 3.  Temporary buffers (only needed when !use_page_cache)
     // ------------------------------------------------------------------
     float *d_partial_out = nullptr;
     float *d_partial_max = nullptr;
     float *d_partial_sum = nullptr;
-    int   *d_block_tables = nullptr;
-    int   *d_seq_lens = nullptr;
+    int   *d_block_tables_local = nullptr;
+    int   *d_seq_lens_local = nullptr;
 
-    CUDA_CHECK(cudaMalloc(&d_partial_out, ws_out * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_partial_max, ws_ms  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_partial_sum, ws_ms  * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_block_tables,
-                         static_cast<size_t>(batch_size) * max_blocks_per_seq * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_seq_lens, batch_size * sizeof(int)));
+    CUDA_CHECK_(cudaMalloc(&d_partial_out,
+        static_cast<size_t>(batch_size) *
+        n_q_heads * num_splits * head_dim *
+        sizeof(float)));
+    CUDA_CHECK_(cudaMalloc(&d_partial_max,
+        static_cast<size_t>(batch_size) *
+        n_q_heads * num_splits *
+        sizeof(float)));
+    CUDA_CHECK_(cudaMalloc(&d_partial_sum,
+        static_cast<size_t>(batch_size) *
+        n_q_heads * num_splits *
+        sizeof(float)));
 
-    // ------------------------------------------------------------------
-    // 5. 初始化 block_tables（逻辑 → 物理）和 seq_lens
-    //    这里使用最简单的 “identity” 映射：物理 block = batch * max_blocks_per_seq + logical
-    // ------------------------------------------------------------------
-    {
-        // Allocate host‑side temporary buffers
-    int *h_block_tables = new int[static_cast<size_t>(batch_size) * max_blocks_per_seq];
-    int *h_seq_lens    = new int[batch_size];
+    if (!use_page_cache) {
+        // --------------------------------------------------------------
+        // Allocate and fill block‑tables + seq_lens on the host, then copy.
+        // --------------------------------------------------------------
+        CUDA_CHECK_(cudaMalloc(&d_block_tables_local,
+                 static_cast<size_t>(batch_size) *
+                 max_blocks_per_seq * sizeof(int)));
+        CUDA_CHECK_(cudaMalloc(&d_seq_lens_local,
+                 static_cast<size_t>(batch_size) *
+                 sizeof(int)));
 
-    for (int b = 0; b < batch_size; ++b) {
-        h_seq_lens[b] = cache_len;               // actual length of each sequence
-        for (int blk = 0; blk < max_blocks_per_seq; ++blk) {
-            // Store **logical** block index only.
-            // The kernel will combine it with the sequence id (seq_idx) later.
-            h_block_tables[b * max_blocks_per_seq + blk] = blk;
+        // Host‑side temporary buffers
+        int *h_block_tables = new int[static_cast<size_t>(batch_size) *
+                                      max_blocks_per_seq];
+        int *h_seq_lens    = new int[batch_size];
+
+        for (int b = 0; b < batch_size; ++b) {
+            h_seq_lens[b] = cache_len;               // actual length of each sequence
+            // **Logical** block IDs: 0 … max_blocks_per_seq‑1
+            for (int blk = 0; blk < max_blocks_per_seq; ++blk) {
+                h_block_tables[b * max_blocks_per_seq + blk] = blk;
+            }
         }
-    }
 
-    // Asynchronously copy to device
-    CUDA_CHECK(cudaMemcpyAsync(d_block_tables, h_block_tables,
-                               static_cast<size_t>(batch_size) * max_blocks_per_seq * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_seq_lens, h_seq_lens,
-                               batch_size * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
+        // Asynchronously copy to device
+        CUDA_CHECK_(cudaMemcpyAsync(d_block_tables_local, h_block_tables,
+                 static_cast<size_t>(batch_size) *
+                 max_blocks_per_seq * sizeof(int),
+                 cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK_(cudaMemcpyAsync(d_seq_lens_local, h_seq_lens,
+                 batch_size * sizeof(int),
+                 cudaMemcpyHostToDevice, stream));
 
-    delete[] h_block_tables;
-    delete[] h_seq_lens;
+        delete[] h_block_tables;
+        delete[] h_seq_lens;
     }
 
     // ------------------------------------------------------------------
-    // 6. 根据 head_dim 进行模板实例化并启动 kernel
-    //    flash_decode_splitk_kernel<HEAD_DIM, BLOCK_SIZE, NUM_WARPS>
-    //    flash_decode_reduce_kernel<HEAD_DIM>
+    // 4.  Choose head_dim and launch kernels
     // ------------------------------------------------------------------
-    // 为了在运行时根据 head_dim 选择编译期常量，使用 std::integral_constant 包装
     auto launch_for_head = [&](auto HEAD) {
-        constexpr int HD = decltype(HEAD)::value;   // 编译期 head_dim
+        constexpr int HD = decltype(HEAD)::value;   // compile‑time head_dim
 
-        // 共享内存大小： (2 * NUM_WARPS + NUM_WARPS * HD) * sizeof(float)
         const size_t smem_bytes = (2 * NUM_WARPS + NUM_WARPS * HD) * sizeof(float);
 
-        // ------------------- split‑K kernel -------------------
+        // split‑K kernel
         dim3 grid_splitk(batch_size, n_q_heads, num_splits);
-        dim3 block_splitk(32 * NUM_WARPS);   // 256 线程
+        dim3 block_splitk(32 * NUM_WARPS);   // 256 threads
 
-        flash_decode_splitk_kernel<HD, BLOCK_SIZE, NUM_WARPS>
+        flash_decode_paged_splitk_kernel<HD, BLOCK_SIZE, NUM_WARPS>
         <<<grid_splitk, block_splitk, smem_bytes, stream>>>(
-            d_q, d_k_cache, d_v_cache,
+            static_cast<const __nv_bfloat16*>(q),
+            static_cast<const __nv_bfloat16*>(k_cache),
+            static_cast<const __nv_bfloat16*>(v_cache),
             d_partial_out, d_partial_max, d_partial_sum,
-            d_block_tables, d_seq_lens,
-            scale, max_blocks_per_seq, n_q_heads, n_kv_heads, num_splits
+            // use the caller‑provided tables if they exist, otherwise the locals we just built
+            use_page_cache ? d_block_tables : d_block_tables_local,
+            use_page_cache ? d_seq_lens   : d_seq_lens_local,
+            scale,
+            max_blocks_per_seq,
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            // <<<--- NEW: pass the true head stride for address calculation
+            head_stride,
+            num_splits
         );
 
-        // ------------------- reduce kernel -------------------
+        // reduce kernel
         dim3 grid_reduce(batch_size, n_q_heads);
         dim3 block_reduce(32);   // 1 warp
 
-        flash_decode_reduce_kernel<HD>
+        flash_decode_paged_reduce_kernel<HD>
         <<<grid_reduce, block_reduce, 0, stream>>>(
             d_partial_out, d_partial_max, d_partial_sum,
-            d_out, n_q_heads, num_splits
+            static_cast<__nv_bfloat16*>(out),
+            n_q_heads,
+            num_splits
         );
     };
 
-    // 只支持常见的 64 / 128 / 256 三种 head_dim（必须能被 32 整除）
     if (head_dim == 64) {
         launch_for_head(std::integral_constant<int, 64>{});
     } else if (head_dim == 128) {
@@ -374,21 +388,24 @@ extern "C" void launch_attention_decode_v4(
         launch_for_head(std::integral_constant<int, 256>{});
     } else {
         fprintf(stderr,
-                "[launch_attention_decode_v4] Unsupported head_dim %d. "
+                "[launch_attention_decode_paged_splitk] Unsupported head_dim %d. "
                 "Supported values: 64, 128, 256.\n",
                 head_dim);
         exit(EXIT_FAILURE);
     }
 
     // ------------------------------------------------------------------
-    // 7. 同步、错误检查并释放临时显存
+    // 5.  Synchronize, error‑check and free temporaries
     // ------------------------------------------------------------------
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK_(cudaGetLastError());
+    CUDA_CHECK_(cudaStreamSynchronize(stream));
 
-    CUDA_CHECK(cudaFree(d_partial_out));
-    CUDA_CHECK(cudaFree(d_partial_max));
-    CUDA_CHECK(cudaFree(d_partial_sum));
-    CUDA_CHECK(cudaFree(d_block_tables));
-    CUDA_CHECK(cudaFree(d_seq_lens));
+    CUDA_CHECK_(cudaFree(d_partial_out));
+    CUDA_CHECK_(cudaFree(d_partial_max));
+    CUDA_CHECK_(cudaFree(d_partial_sum));
+
+    if (!use_page_cache) {
+        CUDA_CHECK_(cudaFree(d_block_tables_local));
+        CUDA_CHECK_(cudaFree(d_seq_lens_local));
+    }
 }

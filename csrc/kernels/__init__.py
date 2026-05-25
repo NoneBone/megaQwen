@@ -28,6 +28,7 @@ def _compile_kernels():
     rope_src = _get_cuda_source("rope.cu")
     attention_prefill_src = _get_cuda_source("attention_prefill.cu")
     attention_decode_src = _get_cuda_source("attention_decode.cu")
+    attention_decode_paged_src = _get_cuda_source("attention_decode_paged.cu")
     audio_attention_src = _get_cuda_source("audio_attention.cu")
 
     # Combined source with Python bindings
@@ -105,7 +106,7 @@ extern "C" void launch_attention_decode##VERSION(                     \
     float scale,                                                       \
     cudaStream_t stream                                                \
 )
-extern "C" void launch_attention_decode_v4_new(
+extern "C" void launch_attention_decode_paged_splitk(
     const void* q,
     const void* k_cache,
     const void* v_cache,
@@ -319,11 +320,13 @@ torch::Tensor cuda_attention_decode##VERSION(                            \
 DECLARE_LAUNCH_ATTENTION_DECODE(_v1);
 DECLARE_LAUNCH_ATTENTION_DECODE(_v2);
 DECLARE_LAUNCH_ATTENTION_DECODE(_v3);
+DECLARE_LAUNCH_ATTENTION_DECODE(_v4);
 DEFINE_CUDA_ATTENTION_DECODE(_v1)
 DEFINE_CUDA_ATTENTION_DECODE(_v2)
 DEFINE_CUDA_ATTENTION_DECODE(_v3)
+DEFINE_CUDA_ATTENTION_DECODE(_v4)
 
-torch::Tensor cuda_attention_decode_v4(
+torch::Tensor cuda_attention_decode_paged_splitk(
     torch::Tensor q,
     torch::Tensor k_cache,
     torch::Tensor v_cache,
@@ -370,7 +373,7 @@ torch::Tensor cuda_attention_decode_v4(
         d_seq_lens = seq_lens.data_ptr<int>();
     }
 
-    launch_attention_decode_v4_new(
+    launch_attention_decode_paged_splitk(
         q_flat.data_ptr(),
         k_cache.data_ptr(),
         v_cache.data_ptr(),
@@ -495,6 +498,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attention_decode_v2", &cuda_attention_decode_v2, "CUDA attention decode");
     m.def("attention_decode_v3", &cuda_attention_decode_v3, "CUDA attention decode");
     m.def("attention_decode_v4", &cuda_attention_decode_v4, "CUDA attention decode");
+    m.def("attention_decode_paged_splitk", &cuda_attention_decode_paged_splitk, "CUDA attention decode");
     m.def("audio_attention", &cuda_audio_attention, "CUDA audio self-attention (B,H,T,D)");
 }
 """
@@ -509,6 +513,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         + attention_prefill_src
         + "\n\n"
         + attention_decode_src
+        + "\n\n"
+        + attention_decode_paged_src
         + "\n\n"
         + audio_attention_src
     )

@@ -5,6 +5,7 @@ Streams tokens to screen as they are generated.
 
 import time
 from dataclasses import dataclass
+from typing import Dict, Tuple
 
 import torch
 import triton
@@ -28,6 +29,55 @@ class Qwen3Config:
     rms_norm_eps: float = 1e-6
     rope_theta: float = 1000000.0
     max_position_embeddings: int = 40960
+
+
+def make_input_ids(tokenizer: AutoTokenizer, length: int, device: torch.device) -> torch.Tensor:
+    """
+    Build a dummy ``input_ids`` tensor that contains exactly ``length`` tokens.
+    We simply repeat the token for the word ``"Hello"``.
+    """
+    token = tokenizer.encode("Hello", add_special_tokens=False)[0]
+    return torch.full((1, length), token, dtype=torch.long, device=device)
+
+
+def benchmark_model(
+    model,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+) -> Tuple[int, Dict[str, float]]:
+    """
+    Run a full generation (prefill + decode) and return timing stats.
+    """
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    logits, kv_caches, prompt_len = model.prefill(input_ids)
+    torch.cuda.synchronize()
+    prefill_time = (time.perf_counter() - t0) * 1e3
+
+    next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    decode_steps = max_new_tokens
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for step in range(decode_steps):
+        logits, kv_caches = model.decode_step(
+            next_token, kv_caches, prompt_len + step
+        )
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    torch.cuda.synchronize()
+    decode_time = (time.perf_counter() - t0) * 1e3
+
+    stats = {
+        "prompt_tokens": prompt_len,
+        "prefill_time_ms": prefill_time,
+        "prefill_speed_toks": (prompt_len / (prefill_time / 1e3)),
+        "decode_steps": decode_steps,
+        "decode_time_ms": decode_time,
+        "decode_speed_toks": (decode_steps / (decode_time / 1e3)),
+        "total_time_ms": (prefill_time + decode_time),
+        "total_speed_toks": ((prompt_len + decode_steps) / ((prefill_time + decode_time) / 1e3)),
+    }
+    total_generated = prompt_len + decode_steps
+    return total_generated, stats
 
 
 # ============================================================================
@@ -275,15 +325,18 @@ class Qwen3Attention:
     # ------------------------------------------------------------------
     def attention_decode(self, q: torch.Tensor, kv_cache: KVCache, cache_len: int) -> torch.Tensor:
         if self.backend == Backend.CUDA:
-            return self.cuda_kernels.attention_decode_v4(
-                q.contiguous(),
-                kv_cache.k_cache.contiguous(),
-                kv_cache.v_cache.contiguous(),
-                cache_len,
-                kv_cache.block_table,
-                kv_cache.seq_lens,
-                self.use_page_cache,
-            )
+            if 1:
+                return self.cuda_kernels.attention_decode_paged_splitk(# decode 调度, 基于 paged attention
+                    q.contiguous(),
+                    kv_cache.k_cache.contiguous(),
+                    kv_cache.v_cache.contiguous(),
+                    cache_len,
+                    kv_cache.block_table,
+                    kv_cache.seq_lens,
+                    self.use_page_cache,
+                )
+            else:
+                return self.cuda_kernels.attention_decode_v2(q.contiguous(), kv_cache.k_cache, kv_cache.v_cache, cache_len)
             # return self.cuda_kernels.attention_decode(
             #     q.contiguous(),
             #     kv_cache.k_cache.contiguous(),
@@ -366,7 +419,7 @@ class Qwen3Attention:
                 attn_out = torch.matmul(attn, v_expanded.float()).to(q.dtype)
             else:
                 # CUDA prefill kernel (already compiled in `cuda_kernels`).
-                attn_out = self.cuda_kernels.attention_prefill(
+                attn_out = self.cuda_kernels.attention_prefill(# prefill 调度
                     q.contiguous(),
                     k_expanded.contiguous(),
                     v_expanded.contiguous(),
@@ -678,12 +731,41 @@ class Qwen3Model:
         print()
         return tokens_generated
 
+
+def fast_answer_test(tokenizer, model):
+    prompt = "list all prime numbers within 100"
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
+    inputs = tokenizer(text, return_tensors="pt").to("cuda")
+    input_ids = inputs["input_ids"]
+
+    print(f"\nInput tokens: {input_ids.shape[1]}")
+
+    max_new_tokens = 256
+    print("\n" + "=" * 70)
+    print(" CUDA")
+    print("=" * 70)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    cuda_tokens = model.generate_streaming(input_ids.clone(), tokenizer, max_new_tokens)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    cuda_time = t1 - t0
+    print(f"[Generated {cuda_tokens} tokens in {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)]")
+
+    print("\n" + "-" * 70)
+    print("Performance Summary:")
+    print(f"  XXXX:   {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)")
+    print()
+
 # ============================================================================
 # Main Demo
 # ============================================================================
 def run_demo():
     print("=" * 70)
-    print(" End-to-End Demo: Torch vs Triton vs CUDA")
+    print(" End-to-End Demo: Torch vs Triton vs CUDA (with detailed timing)")
     print("=" * 70)
 
     # ------------------------------------------------------------------
@@ -708,64 +790,53 @@ def run_demo():
     # Configuration & backend models.
     # ------------------------------------------------------------------
     config = Qwen3Config()
-    max_new_tokens = 256
+    scenarios = [
+        ("Short", 20, 50, 70, "decode"),
+        ("Medium", 256, 128, 356, "balanced"),
+        ("Long", 1024, 156, 1224, "prefill"),
+        ("Very Long1", 4096, 1024, 4396, "prefill+cache"),
+        ("Very Long2", 8192, 2048, 4396, "prefill-8k"),
+    ]
+    model_max_new_tokens = max(256, max(decode_steps for _, _, decode_steps, _, _ in scenarios))
     print("Creating backend models...")
-    torch_model = Qwen3Model(hf_model, config, Backend.TORCH, max_new_tokens=max_new_tokens)
-    triton_model = Qwen3Model(hf_model, config, Backend.TRITON, max_new_tokens=max_new_tokens)
+    torch_model = Qwen3Model(hf_model, config, Backend.TORCH, max_new_tokens=model_max_new_tokens)
+    triton_model = Qwen3Model(hf_model, config, Backend.TRITON, max_new_tokens=model_max_new_tokens)
     cuda_model = Qwen3Model(
         hf_model,
         config,
         Backend.CUDA,
         cuda_kernels,
         use_page_cache=True,
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=model_max_new_tokens,
     )
     print("Done!\n")
 
-    count = 0
-    while True:
-        print("-" * 70)
-        prompt = "list all prime numbers within 100"
-        count += 1
-        if count == 2:
-            break
+    mod = cuda_model
+    if mod:
+        fast_answer_test(tokenizer, mod)
+        for name, prompt_len, decode_steps, total_ctx, dominant in scenarios:
+            _ = total_ctx
+            print("-" * 70)
+            print(f"Scenario: {name} (prompt={prompt_len}, decode={decode_steps}) – dominant: {dominant}")
 
-        messages = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-        )
-        inputs = tokenizer(text, return_tensors="pt").to("cuda")
-        input_ids = inputs["input_ids"]
+            input_ids = make_input_ids(tokenizer, prompt_len, torch.device("cuda"))
 
-        print(f"\nInput tokens: {input_ids.shape[1]}")
+            torch.cuda.synchronize()
+            _, stats = benchmark_model(mod, input_ids, decode_steps)
 
-        max_new_tokens = 256
+            print(f"Prompt tokens : {stats['prompt_tokens']}")
+            print(f"Prefill time  : {stats['prefill_time_ms']:.1f} ms")
+            print(f"Prefill speed : {stats['prefill_speed_toks']:.0f} tokens/s")
+            print(f"Decode steps  : {stats['decode_steps']}")
+            print(f"Decode time   : {stats['decode_time_ms']:.1f} ms")
+            print(f"Decode speed  : {stats['decode_speed_toks']:.0f} tokens/s")
+            print(f"Total time    : {stats['total_time_ms']:.1f} ms")
+            print(f"Total speed   : {stats['total_speed_toks']:.0f} tokens/s")
+            print()
 
-        # ------------------------------------------------------------------
-        # CUDA backend (the only one that uses the paged KV cache now).
-        # ------------------------------------------------------------------
-        print("\n" + "=" * 70)
-        print(" CUDA")
-        print("=" * 70)
-        torch.cuda.synchronize()
-        cuda_tokens = cuda_model.generate_streaming(
-            input_ids.clone(), tokenizer, max_new_tokens
-        )
-        t0 = time.perf_counter()
-        cuda_tokens = cuda_model.generate_streaming(
-            input_ids.clone(), tokenizer, max_new_tokens
-        )
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        cuda_time = t1 - t0
-        print(
-            f"[Generated {cuda_tokens} tokens in {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)]"
-        )
-
-        print("\n" + "-" * 70)
-        print("Performance Summary:")
-        print(f"  CUDA:   {cuda_time:.3f}s ({cuda_tokens/cuda_time:.1f} tok/s)")
-        print()
+    print("=" * 70)
+    print("All scenarios completed.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ mkdir ./build
 -o build/test_attention \
 test_unit/test_attention.cu \
 kernels/attention_decode.cu \
-kernels/attention_decode_v4.cu \
+kernels/attention_decode_paged.cu \
 kernels/attention_prefill.cu
 
 ./build/test_attention
@@ -104,7 +104,7 @@ kernels/attention_prefill.cu
 - v4: FlashDecoding‑style 的 Split‑K 并行与两阶段归约 (适用于短序列, 建议根据 HQ * B 调整 num_splits)
     - 显式支持 block table, 与 PagedAttention / vLLM​ 对齐, 更接近生产级推理引擎 ( TODO: 解耦 block table )
     - 128‑bit 对齐加载, 更高 L2 / DRAM 利用率, 更少 load instruction
-    - 注意： 集成测试采用的是另外的 launch_attention_decode_v4_new
+    - 注意： 集成测试采用的是另外的 launch_attention_decode_paged_splitk
 
 ```sh
 === Decode-v1 benchmarks (warmup=10, iters=10) ===
@@ -135,12 +135,12 @@ kernels/attention_prefill.cu
 [BENCH] Decode  B=128 ctx=2048  H_q=16 H_kv=8                    4402.59 us   244.1 GB/s
 
 === Decode-v4 benchmarks (warmup=10, iters=10) ===
-[BENCH] Decode  B=1   ctx=512   H_q=16 H_kv=8                      25.41 us    82.9 GB/s
-[BENCH] Decode  B=1   ctx=2048  H_q=16 H_kv=8                      55.30 us   151.8 GB/s
-[BENCH] Decode  B=16  ctx=512   H_q=16 H_kv=8                      66.17 us   509.1 GB/s
-[BENCH] Decode  B=16  ctx=2048  H_q=16 H_kv=8                     578.88 us   232.1 GB/s
-[BENCH] Decode  B=64  ctx=512   H_q=16 H_kv=8                     510.02 us   264.2 GB/s
-[BENCH] Decode  B=64  ctx=2048  H_q=16 H_kv=8                    2656.18 us   202.3 GB/s
-[BENCH] Decode  B=128 ctx=2048  H_q=16 H_kv=8                    6622.25 us   162.3 GB/s
+[BENCH] Decode  B=1   ctx=512   H_q=16 H_kv=8                      18.43 us   114.2 GB/s
+[BENCH] Decode  B=1   ctx=2048  H_q=16 H_kv=8                      40.65 us   206.5 GB/s
+[BENCH] Decode  B=16  ctx=512   H_q=16 H_kv=8                      58.46 us   576.2 GB/s
+[BENCH] Decode  B=16  ctx=2048  H_q=16 H_kv=8                     527.13 us   254.9 GB/s
+[BENCH] Decode  B=64  ctx=512   H_q=16 H_kv=8                     504.43 us   267.1 GB/s
+[BENCH] Decode  B=64  ctx=2048  H_q=16 H_kv=8                    2544.03 us   211.2 GB/s
+[BENCH] Decode  B=128 ctx=2048  H_q=16 H_kv=8                    6262.17 us   171.6 GB/s
 ```
 
