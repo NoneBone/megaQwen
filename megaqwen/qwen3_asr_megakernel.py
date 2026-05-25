@@ -125,6 +125,10 @@ _ASR_MEGAKERNEL_DEFAULT_KNOBS: dict[str, str] = {
     "MEGAQWEN_SPLIT_O_W4": "1",
     "MEGAQWEN_SPLIT_FFN_W4": "1",
     "MEGAQWEN_SPLIT_FFN_W4_FUSED": "1",
+    # "MEGAQWEN_SPLIT_QKV_W4": "0",
+    # "MEGAQWEN_SPLIT_O_W4": "0",
+    # "MEGAQWEN_SPLIT_FFN_W4": "0",
+    # "MEGAQWEN_SPLIT_FFN_W4_FUSED": "0",
     # Audio tower inference defaults.
     "MEGAQWEN_AUDIO_TOWER_ATTN_IMPL": "flash_attention_2",
     "MEGAQWEN_AUDIO_TOWER_ALLOW_TF32": "1",
@@ -144,8 +148,8 @@ _ASR_MEGAKERNEL_DEFAULT_KNOBS: dict[str, str] = {
     # Long-audio chunking for stable prefill length (seconds per chunk).
     "MEGAQWEN_ASR_CHUNK_SEC": "60",
     # Debug logs are OFF by default; enable explicitly when profiling internals.
-    "MEGAQWEN_DEBUG_PREFILL_STAGE": "0",
-    "MEGAQWEN_DEBUG_SPLIT_STAGE": "0",
+    "MEGAQWEN_DEBUG_PREFILL_STAGE": "0",        # prefill 耗时分解
+    "MEGAQWEN_DEBUG_SPLIT_STAGE": "0",          # decode 耗时分解
     "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG": "0",      # 
     "MEGAQWEN_DEBUG_FLASH_DECODE": "0",         # 调试总控开关
 }
@@ -689,6 +693,7 @@ class Qwen3ASRMegakernelModel:
         language: str | None,
         timer: StageTimer,
     ) -> ASRResult:
+        ''' 函数功能： '''
         input_features, attention_mask = self._extract_features(audio, sr=sr, timer=timer)
 
         with timer.cuda("audio_tower"):
@@ -743,6 +748,7 @@ class Qwen3ASRMegakernelModel:
         return_language: bool = False,
         timer: StageTimer | None = None,
     ) -> str | tuple[str | None, str]:
+        ''' 对外 API, 返回字符串或 (language, text) '''
         res = self.transcribe_result(
             wav_path,
             max_new_tokens=max_new_tokens,
@@ -760,22 +766,25 @@ class Qwen3ASRMegakernelModel:
         language: str | None = None,
         timer: StageTimer | None = None,
     ) -> ASRResult:
+        ''' 真实执行逻辑，返回结构化 ASRResult '''
         timer = timer if timer is not None else StageTimer(enabled=False)
 
         with timer.cpu("wav_load"):
-            audio, sr = load_wav_mono(wav_path, target_sr=16000)
+            audio, sr = load_wav_mono(wav_path, target_sr=16000) # 单声道, 重采样到 16 kHz
 
         max_new = int(max_new_tokens if max_new_tokens is not None else self.opts.max_new_tokens)
         chunk_sec = self._asr_chunk_seconds()
         chunks: list[np.ndarray]
-        if chunk_sec > 0.0:
+        if chunk_sec > 0.0: # 按秒切分成多个 chunk
             with timer.cpu("chunk_split"):
                 chunks = _split_audio_into_chunks(audio, sr=sr, max_chunk_sec=chunk_sec)
-        else:
+        else:               # 整个音频作为一个 chunk
             chunks = [np.asarray(audio, dtype=np.float32)]
 
         results: list[ASRResult] = []
-        pending: list[np.ndarray] = [np.asarray(c, dtype=np.float32, copy=False) for c in chunks]
+        pending: list[np.ndarray] = [
+            np.asarray(c, dtype=np.float32) for c in chunks
+        ]
         min_samples_to_split = max(int(sr), 2)
         while pending:
             piece = pending.pop(0)

@@ -223,6 +223,44 @@ def _dequantize_bnb4_weight(
     return _as_bf16_contiguous(dequant)
 
 
+def _online_quantize_bnb4_weight(
+    weight_key: str,
+    weight: torch.Tensor,
+    *,
+    blocksize: int = 64,
+    quant_type: str = "nf4",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    try:
+        from bitsandbytes import functional as bnbf
+    except Exception as exc:
+        raise RuntimeError(
+            f"Online 4bit quantization requested for {weight_key}, but bitsandbytes is not available."
+        ) from exc
+
+    if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise RuntimeError(f"Unsupported dtype for online W4 quantization of {weight_key}: {weight.dtype}")
+    if quant_type not in ("nf4", "fp4"):
+        raise RuntimeError(f"Unsupported W4 quant_type for {weight_key}: {quant_type}")
+
+    packed_weight, quant_state = bnbf.quantize_4bit(
+        weight.contiguous(),
+        blocksize=blocksize,
+        compress_statistics=False,
+        quant_type=quant_type,
+        quant_storage=torch.uint8,
+    )
+    qdict = quant_state.as_dict(packed=True)
+    meta_tensors: dict[str, torch.Tensor] = {
+        weight_key: packed_weight,
+    }
+    for key, value in qdict.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        meta_tensors[weight_key + "." + key] = value
+    block_scales, codebook = _bnb4_block_scales_and_codebook(weight_key, meta_tensors)
+    return packed_weight.contiguous(), block_scales.contiguous(), codebook.contiguous()
+
+
 def load_qwen3_weights(model_name: str = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", max_seq_len: int = 2048):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -292,6 +330,7 @@ def load_qwen3_weights(model_name: str = "/media/l8w/Linux118/PROJECTS/29-vllm-s
         runtime_qkv_w4_enabled = str(os.environ.get("MEGAQWEN_SPLIT_QKV_W4", "")).lower() not in ("", "0", "false")
         runtime_o_w4_enabled = str(os.environ.get("MEGAQWEN_SPLIT_O_W4", "")).lower() not in ("", "0", "false")
         runtime_w4_enabled = runtime_ffn_w4_enabled or runtime_qkv_w4_enabled or runtime_o_w4_enabled
+        runtime_w4_quant_type = str(os.environ.get("MEGAQWEN_SPLIT_W4_QUANT_TYPE", "nf4")).strip().lower() or "nf4"
         split_q_w4_packed: list[torch.Tensor] = []
         split_q_w4_scales: list[torch.Tensor] = []
         split_q_w4_codebook: list[torch.Tensor] = []
@@ -310,6 +349,7 @@ def load_qwen3_weights(model_name: str = "/media/l8w/Linux118/PROJECTS/29-vllm-s
         split_down_w4_packed: list[torch.Tensor] = []
         split_down_w4_scales: list[torch.Tensor] = []
         split_down_w4_codebook: list[torch.Tensor] = []
+        online_quantized_weight_keys: list[str] = []
         if quantized_weight_keys:
             print(
                 f"[MEGAQWEN_W4] detected {len(quantized_weight_keys)} packed 4bit weights; "
@@ -322,96 +362,101 @@ def load_qwen3_weights(model_name: str = "/media/l8w/Linux118/PROJECTS/29-vllm-s
             if quant_meta_keys:
                 tensors.update(load_tensors(model_dir, quant_meta_keys, device="cuda"))
 
-            if runtime_w4_enabled:
-                try:
-                    for i in range(num_layers):
-                        p = f"{text_prefix}layers.{i}."
-                        q_key = p + "self_attn.q_proj.weight"
-                        k_key = p + "self_attn.k_proj.weight"
-                        v_key = p + "self_attn.v_proj.weight"
-                        o_key = p + "self_attn.o_proj.weight"
-                        gate_key = p + "mlp.gate_proj.weight"
-                        up_key = p + "mlp.up_proj.weight"
-                        down_key = p + "mlp.down_proj.weight"
+        if runtime_w4_enabled:
+            try:
+                def _runtime_w4_triplet(weight_key: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                    if weight_key not in tensors:
+                        raise RuntimeError(f"Missing tensor for {weight_key}")
+                    tensor = tensors[weight_key]
+                    if tensor.dtype == torch.uint8:
+                        scales, codebook = _bnb4_block_scales_and_codebook(weight_key, tensors)
+                        return tensor.view(-1).contiguous(), scales.contiguous(), codebook.contiguous()
+                    packed, scales, codebook = _online_quantize_bnb4_weight(
+                        weight_key,
+                        tensor,
+                        blocksize=64,
+                        quant_type=runtime_w4_quant_type,
+                    )
+                    online_quantized_weight_keys.append(weight_key)
+                    return packed.view(-1).contiguous(), scales, codebook
 
-                        if runtime_qkv_w4_enabled:
-                            if not (
-                                q_key in tensors and k_key in tensors and v_key in tensors and
-                                tensors[q_key].dtype == torch.uint8 and
-                                tensors[k_key].dtype == torch.uint8 and
-                                tensors[v_key].dtype == torch.uint8
-                            ):
-                                raise RuntimeError(f"Layer {i} missing W4 packed QKV tensors")
-                            q_scales, q_code = _bnb4_block_scales_and_codebook(q_key, tensors)
-                            k_scales, k_code = _bnb4_block_scales_and_codebook(k_key, tensors)
-                            v_scales, v_code = _bnb4_block_scales_and_codebook(v_key, tensors)
-                            split_q_w4_packed.append(tensors[q_key].view(-1).contiguous())
-                            split_q_w4_scales.append(q_scales.contiguous())
-                            split_q_w4_codebook.append(q_code.contiguous())
-                            split_k_w4_packed.append(tensors[k_key].view(-1).contiguous())
-                            split_k_w4_scales.append(k_scales.contiguous())
-                            split_k_w4_codebook.append(k_code.contiguous())
-                            split_v_w4_packed.append(tensors[v_key].view(-1).contiguous())
-                            split_v_w4_scales.append(v_scales.contiguous())
-                            split_v_w4_codebook.append(v_code.contiguous())
+                for i in range(num_layers):
+                    p = f"{text_prefix}layers.{i}."
+                    q_key = p + "self_attn.q_proj.weight"
+                    k_key = p + "self_attn.k_proj.weight"
+                    v_key = p + "self_attn.v_proj.weight"
+                    o_key = p + "self_attn.o_proj.weight"
+                    gate_key = p + "mlp.gate_proj.weight"
+                    up_key = p + "mlp.up_proj.weight"
+                    down_key = p + "mlp.down_proj.weight"
 
-                        if runtime_o_w4_enabled:
-                            if not (o_key in tensors and tensors[o_key].dtype == torch.uint8):
-                                raise RuntimeError(f"Layer {i} missing W4 packed O tensor")
-                            o_scales, o_code = _bnb4_block_scales_and_codebook(o_key, tensors)
-                            split_o_w4_packed.append(tensors[o_key].view(-1).contiguous())
-                            split_o_w4_scales.append(o_scales.contiguous())
-                            split_o_w4_codebook.append(o_code.contiguous())
-
-                        if runtime_ffn_w4_enabled:
-                            if not (
-                                gate_key in tensors and up_key in tensors and down_key in tensors and
-                                tensors[gate_key].dtype == torch.uint8 and
-                                tensors[up_key].dtype == torch.uint8 and
-                                tensors[down_key].dtype == torch.uint8
-                            ):
-                                raise RuntimeError(f"Layer {i} missing W4 packed FFN tensors")
-                            gate_scales, gate_code = _bnb4_block_scales_and_codebook(gate_key, tensors)
-                            up_scales, up_code = _bnb4_block_scales_and_codebook(up_key, tensors)
-                            down_scales, down_code = _bnb4_block_scales_and_codebook(down_key, tensors)
-                            split_gateup_w4_packed.append(
-                                torch.cat([tensors[gate_key].view(-1), tensors[up_key].view(-1)], dim=0).contiguous()
-                            )
-                            split_gateup_w4_scales.append(torch.cat([gate_scales, up_scales], dim=0).contiguous())
-                            split_gateup_w4_codebook.append(torch.cat([gate_code, up_code], dim=0).contiguous())
-                            split_down_w4_packed.append(tensors[down_key].view(-1).contiguous())
-                            split_down_w4_scales.append(down_scales.contiguous())
-                            split_down_w4_codebook.append(down_code.contiguous())
-
-                    msg_parts: list[str] = []
                     if runtime_qkv_w4_enabled:
-                        msg_parts.append("QKV")
+                        q_packed, q_scales, q_code = _runtime_w4_triplet(q_key)
+                        k_packed, k_scales, k_code = _runtime_w4_triplet(k_key)
+                        v_packed, v_scales, v_code = _runtime_w4_triplet(v_key)
+                        split_q_w4_packed.append(q_packed)
+                        split_q_w4_scales.append(q_scales)
+                        split_q_w4_codebook.append(q_code)
+                        split_k_w4_packed.append(k_packed)
+                        split_k_w4_scales.append(k_scales)
+                        split_k_w4_codebook.append(k_code)
+                        split_v_w4_packed.append(v_packed)
+                        split_v_w4_scales.append(v_scales)
+                        split_v_w4_codebook.append(v_code)
+
                     if runtime_o_w4_enabled:
-                        msg_parts.append("O")
+                        o_packed, o_scales, o_code = _runtime_w4_triplet(o_key)
+                        split_o_w4_packed.append(o_packed)
+                        split_o_w4_scales.append(o_scales)
+                        split_o_w4_codebook.append(o_code)
+
                     if runtime_ffn_w4_enabled:
-                        msg_parts.append("FFN")
-                    msg = "+".join(msg_parts) if msg_parts else "none"
+                        gate_packed, gate_scales, gate_code = _runtime_w4_triplet(gate_key)
+                        up_packed, up_scales, up_code = _runtime_w4_triplet(up_key)
+                        down_packed, down_scales, down_code = _runtime_w4_triplet(down_key)
+                        split_gateup_w4_packed.append(torch.cat([gate_packed, up_packed], dim=0).contiguous())
+                        split_gateup_w4_scales.append(torch.cat([gate_scales, up_scales], dim=0).contiguous())
+                        split_gateup_w4_codebook.append(torch.cat([gate_code, up_code], dim=0).contiguous())
+                        split_down_w4_packed.append(down_packed)
+                        split_down_w4_scales.append(down_scales)
+                        split_down_w4_codebook.append(down_code)
+
+                msg_parts: list[str] = []
+                if runtime_qkv_w4_enabled:
+                    msg_parts.append("QKV")
+                if runtime_o_w4_enabled:
+                    msg_parts.append("O")
+                if runtime_ffn_w4_enabled:
+                    msg_parts.append("FFN")
+                msg = "+".join(msg_parts) if msg_parts else "none"
+                if online_quantized_weight_keys:
+                    uq = len(dict.fromkeys(online_quantized_weight_keys))
+                    print(
+                        f"[MEGAQWEN_W4] runtime {msg} W4 tensors prepared for split decode "
+                        f"(online quantized {uq} BF16 weights as {runtime_w4_quant_type})"
+                    )
+                else:
                     print(f"[MEGAQWEN_W4] runtime {msg} W4 tensors prepared for split decode")
-                except Exception as exc:
-                    split_q_w4_packed = []
-                    split_q_w4_scales = []
-                    split_q_w4_codebook = []
-                    split_k_w4_packed = []
-                    split_k_w4_scales = []
-                    split_k_w4_codebook = []
-                    split_v_w4_packed = []
-                    split_v_w4_scales = []
-                    split_v_w4_codebook = []
-                    split_o_w4_packed = []
-                    split_o_w4_scales = []
-                    split_o_w4_codebook = []
-                    split_gateup_w4_packed = []
-                    split_gateup_w4_scales = []
-                    split_gateup_w4_codebook = []
-                    split_down_w4_packed = []
-                    split_down_w4_scales = []
-                    split_down_w4_codebook = []
-                    print(f"[MEGAQWEN_W4] runtime FFN W4 prepare failed, fallback to BF16 split path: {exc}")
+            except Exception as exc:
+                split_q_w4_packed = []
+                split_q_w4_scales = []
+                split_q_w4_codebook = []
+                split_k_w4_packed = []
+                split_k_w4_scales = []
+                split_k_w4_codebook = []
+                split_v_w4_packed = []
+                split_v_w4_scales = []
+                split_v_w4_codebook = []
+                split_o_w4_packed = []
+                split_o_w4_scales = []
+                split_o_w4_codebook = []
+                split_gateup_w4_packed = []
+                split_gateup_w4_scales = []
+                split_gateup_w4_codebook = []
+                split_down_w4_packed = []
+                split_down_w4_scales = []
+                split_down_w4_codebook = []
+                print(f"[MEGAQWEN_W4] runtime W4 prepare failed, fallback to BF16 split path: {exc}")
 
             for weight_key in quantized_weight_keys:
                 tensors[weight_key] = _dequantize_bnb4_weight(weight_key, tensors[weight_key], tensors)
