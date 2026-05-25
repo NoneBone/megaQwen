@@ -29,7 +29,7 @@ class MegakernelGenerator:
     def generate(self, prompt, max_new_tokens=100, temperature=1.0, stop_tokens=None):
         self.decoder.reset()
         input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
-        for token_id in input_ids[:-1]:
+        for token_id in input_ids[:-1]: # fake prefill调度
             self.decoder.decode_step(token_id)
 
         generated = []
