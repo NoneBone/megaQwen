@@ -1,5 +1,5 @@
 """
-Experiment: Cooperative Kernel vs CUDA Graph
+(Deprecated)Experiment: Cooperative Kernel vs CUDA Graph
 
 Hypothesis: Splitting the megakernel at grid.sync() points and using
 CUDA graphs might outperform cooperative kernel launch because:
@@ -817,52 +817,113 @@ def count_kernel_launches():
 
 def benchmark_launch_overhead():
     """
-    Benchmark pure kernel launch overhead without computation.
-    This isolates the cost of cooperative kernel launch vs regular kernels.
+    Benchmark pure kernel‑launch overhead (no work inside the kernel).
+    The test compares a “regular” launch with a launch that pretends to be
+    cooperative – both are ordinary launches, but the timing shows the raw
+    launch cost.
     """
     print("\n" + "="*60)
     print("KERNEL LAUNCH OVERHEAD BENCHMARK")
     print("="*60)
 
     # Simple empty kernels
-    empty_kernel_src = r'''
-__global__ void empty_coop_kernel() {
-    // Just sync and return
+    cuda_src = r'''
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// ------------------------------------------------------------------
+// Empty kernels – they do nothing but a __syncthreads() so the
+// compiler does not discard them.
+// ------------------------------------------------------------------
+extern "C" __global__ void empty_coop_kernel() {
+    __syncthreads();
+}
+extern "C" __global__ void empty_regular_kernel() {
     __syncthreads();
 }
 
-__global__ void empty_regular_kernel() {
-    __syncthreads();
+// ------------------------------------------------------------------
+// Launcher for the “cooperative‑style” kernel.
+// The launch parameters are passed as plain int64_t values.
+// ------------------------------------------------------------------
+void launch_empty_coop_kernel(int64_t grid_x, int64_t block_x) {
+    dim3 grid(grid_x);
+    dim3 block(block_x);
+    // Normal launch – the kernel itself is empty.
+    empty_coop_kernel<<<grid, block>>>();
+}
+
+// ------------------------------------------------------------------
+// Launcher for the regular kernel.
+// ------------------------------------------------------------------
+void launch_empty_regular_kernel(int64_t grid_x, int64_t block_x) {
+    dim3 grid(grid_x);
+    dim3 block(block_x);
+    empty_regular_kernel<<<grid, block>>>();
+}
+
+// ------------------------------------------------------------------
+// Bind the two launchers to Python via pybind11.
+// ------------------------------------------------------------------
+PYBIND11_MODULE(empty_kernels, m) {
+    m.def("empty_coop_kernel",
+          &launch_empty_coop_kernel,
+          "Launch an empty cooperative‑style kernel (grid, block)");
+    m.def("empty_regular_kernel",
+          &launch_empty_regular_kernel,
+          "Launch an empty regular kernel (grid, block)");
 }
 '''
+
+    # --------------------------------------------------------------
+    #     Build the extension.  No C++ source is needed – everything
+    #     lives in the CUDA file compiled by nvcc.
+    # --------------------------------------------------------------
     from torch.utils.cpp_extension import load_inline
 
     empty_module = load_inline(
         name="empty_kernels",
-        cpp_sources="",
-        cuda_sources=empty_kernel_src,
+        cpp_sources="",          # ← empty C++ part
+        cuda_sources=cuda_src,
+        extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
         verbose=False,
     )
 
-    # Benchmark regular kernel launches
+    # --------------------------------------------------------------
+    #   Benchmark the two launch paths.
+    # --------------------------------------------------------------
     torch.cuda.synchronize()
 
     n_launches = 1000
+    grid = 82      # matches the original launch grid (1‑D)
+    block = 256    # matches the original launch block (1‑D)
 
-    # Regular kernels
+    # ---- regular kernel -------------------------------------------------
     start = time.perf_counter()
     for _ in range(n_launches):
-        empty_module.empty_regular_kernel[(82,), (256,)]()
+        empty_module.empty_regular_kernel(grid, block)
     torch.cuda.synchronize()
-    regular_time = (time.perf_counter() - start) / n_launches * 1e6
+    regular_us = (time.perf_counter() - start) / n_launches * 1e6
+    print(f"Regular kernel launch: {regular_us:.2f} µs per launch")
+    print(f"340 regular launches (split approach): {regular_us * 340:.0f} µs total")
 
-    print(f"Regular kernel launch: {regular_time:.2f} us per launch")
-    print(f"For 340 launches (split approach): {regular_time * 340:.0f} us total")
+    # ---- “cooperative‑style” kernel --------------------------------------
+    start = time.perf_counter()
+    for _ in range(n_launches):
+        empty_module.empty_coop_kernel(grid, block)
+    torch.cuda.synchronize()
+    coop_us = (time.perf_counter() - start) / n_launches * 1e6
+    print(f"Cooperative‑style kernel launch: {coop_us:.2f} µs per launch")
+    print(f"Overhead ratio (coop / regular): {coop_us / regular_us:.2f}")
 
-    # The cooperative kernel launch overhead is harder to measure in isolation
-    # because cudaLaunchCooperativeKernel requires specific setup
-    # But we can infer from the full benchmark
+    # NOTE:
+    # A *true* cooperative launch would use `cudaLaunchCooperativeKernel`,
+    # which requires a device with compute capability ≥ 6.0 and a special
+    # launch configuration.  Implementing that is beyond the scope of this
+    # simple benchmark, but the timings above give you the raw launch cost
+    # for two identical kernels.
+
 
 
 def main():
@@ -880,7 +941,7 @@ def main():
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B",
+        "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B",
         torch_dtype=torch.bfloat16,
         device_map="cuda"
     )

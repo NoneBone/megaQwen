@@ -99,25 +99,28 @@ def _dequantize_bnb4_weight(
 _ASR_MEGAKERNEL_DEFAULT_KNOBS: dict[str, str] = {
     # Prefill attention: use flash_ext path by default (with experimental gate),
     # and keep tail legacy layers for quality stability.
-    "MEGAQWEN_PREFILL_ATTN_IMPL": "flash_ext",
-    "MEGAQWEN_PREFILL_ATTN_EXPERIMENTAL": "1",
-    "MEGAQWEN_PREFILL_FLASH_EXT_TAIL_LEGACY_LAYERS": "2",
+    "MEGAQWEN_PREFILL_ATTN_IMPL": "flash",     # -1 unknown, 0 legacy, 1 splitk, 2 auto, 3 flash, 4 flash_ext
+    "MEGAQWEN_PREFILL_ATTN_EXPERIMENTAL": "1", # 
+    "MEGAQWEN_PREFILL_FLASH_EXT_TAIL_LEGACY_LAYERS": "2",# 2 for flash_ext layer, 0 for all flash
     # Decode: use split_gemm + GPU-side greedy loop.
     "MEGAQWEN_DECODE_BACKEND": "split_gemm",
     "MEGAQWEN_DECODE_GPU_LOOP": "1",
     # Aggressive flash-decode defaults (can still be overridden by env).
-    "MEGAQWEN_SPLIT_ATTN_IMPL": "flash_decode",
+    "MEGAQWEN_SPLIT_ATTN_IMPL": "flash_decode", #  0=legacy, 1=splitk(v1, one block per head), 2=splitk2(seq-split two-phase), 3=flash_decode(tile-online)
     "MEGAQWEN_SPLIT_FLASH_WARPS": "4",
-    "MEGAQWEN_SPLIT_FLASH_PARTS": "1",
-    "MEGAQWEN_SPLIT_ATTN_CHUNK": "64",
-    "MEGAQWEN_SPLIT_QKV_GEMM_IMPL": "gemmex",
+    "MEGAQWEN_SPLIT_FLASH_PARTS": "1",          # 当 part >1, 会插入 decode_attention_cache_flash_reduce_parts_kernel
+    "MEGAQWEN_SPLIT_ATTN_CHUNK": "64",          # FD 算法中二阶段归约的 CHUNK 数目，16 / 设定值 / max_seq_len_
+    "MEGAQWEN_SPLIT_QKV_GEMM_IMPL": "gemmex",   # 为1时，采用cublasLt(+fallback), 为0或者 gemmex 或者 cublas 或者false，则采用 cublasGemmEx 函数
+    # Config for PagedAttn
     "MEGAQWEN_SPLIT_KV_LAYOUT": "paged",
     "MEGAQWEN_SPLIT_KV_BLOCK_SIZE": "16",
-    "MEGAQWEN_SPLIT_KV_FP8": "1",
-    "MEGAQWEN_SPLIT_KV_FP8_ONLY": "1",
-    "MEGAQWEN_SPLIT_FLASH_GQA_SHARE": "1",
-    "MEGAQWEN_SPLIT_FLASH_GQA_MODE": "tc",
-    "MEGAQWEN_SPLIT_FLASH_FP8_TC_QK": "1",
+    "MEGAQWEN_SPLIT_KV_FP8": "1",               # FP8 KV 初始化
+    "MEGAQWEN_SPLIT_KV_FP8_ONLY": "1",          # 在启用FP8时，另外配置 decode_qk_norm_rope_cache_kernel
+    # MEGAQWEN_SPLIT_ATTN_IMPL ==3 的变体控制
+    "MEGAQWEN_SPLIT_FLASH_GQA_SHARE": "1",      # 当 MEGAQWEN_SPLIT_ATTN_IMPL ==3，控制GQA变体的有效性
+    "MEGAQWEN_SPLIT_FLASH_GQA_MODE": "tc",      # 总控开关。当 MEGAQWEN_SPLIT_FLASH_GQA_SHARE == 1时，0 for tensorCore, 1 for simt_fast TODO: simt_fast 用了什么指令
+    "MEGAQWEN_SPLIT_FLASH_FP8_TC_QK": "1",      # 细粒度使能开关。
+    # W4A16量化与反量化, 用于权重加载 load_qwen3_weights
     "MEGAQWEN_SPLIT_QKV_W4": "1",
     "MEGAQWEN_SPLIT_O_W4": "1",
     "MEGAQWEN_SPLIT_FFN_W4": "1",
@@ -143,12 +146,33 @@ _ASR_MEGAKERNEL_DEFAULT_KNOBS: dict[str, str] = {
     # Debug logs are OFF by default; enable explicitly when profiling internals.
     "MEGAQWEN_DEBUG_PREFILL_STAGE": "0",
     "MEGAQWEN_DEBUG_SPLIT_STAGE": "0",
-    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG": "0",
-    "MEGAQWEN_DEBUG_FLASH_DECODE": "0",
+    "MEGAQWEN_DEBUG_SPLIT_STAGE_AVG": "0",      # 
+    "MEGAQWEN_DEBUG_FLASH_DECODE": "0",         # 调试总控开关
 }
 
+def _apply_asr_megakernel_default_knobs(ATTN_METHOD=33) -> None:
+    # ENVIRONMENT MANAGE
+    #  0=legacy, 1=splitk(v1, one block per head), 2=splitk2(seq-split two-phase), 3=flash_decode(tile-online)
+    if(ATTN_METHOD==0):
+        _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_ATTN_IMPL"]="legacy"
+    elif(ATTN_METHOD==10):
+        _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_ATTN_IMPL"]="splitk"
+    elif(ATTN_METHOD==20):
+        print("ERROR cause by decode_attention_cache_splitk_phase1_kernel !")
+        # _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_ATTN_IMPL"]="splitk2"
+        pass
+    elif(ATTN_METHOD==30):# V3 Warning：need manually change "置零"
+        # _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_ATTN_IMPL"]="flash_decode"
+        pass
+    elif(ATTN_METHOD==31):# v3S0
+        _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_ATTN_IMPL"]="flash_decode"
+        _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_FLASH_GQA_SHARE"]="0"
+    elif(ATTN_METHOD==32):# v3GQA
+        _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_ATTN_IMPL"]="flash_decode"
+        _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_FLASH_GQA_MODE"]="simt_fast"
+    elif(ATTN_METHOD==33):
+        _ASR_MEGAKERNEL_DEFAULT_KNOBS["MEGAQWEN_SPLIT_ATTN_IMPL"]="flash_decode"
 
-def _apply_asr_megakernel_default_knobs() -> None:
     for key, value in _ASR_MEGAKERNEL_DEFAULT_KNOBS.items():
         os.environ.setdefault(key, value)
 

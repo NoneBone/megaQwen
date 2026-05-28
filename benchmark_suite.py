@@ -48,9 +48,9 @@ def benchmark_pytorch_hf(decode_tokens: int = 100) -> BenchmarkResult:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     print("  Loading HuggingFace model...")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    tokenizer = AutoTokenizer.from_pretrained("/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B")
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B",
+        "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B",
         torch_dtype=torch.bfloat16,
         device_map="cuda"
     )

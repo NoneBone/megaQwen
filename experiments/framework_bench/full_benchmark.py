@@ -19,7 +19,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 import torch
 import torch.nn.functional as F
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B"
 GGUF_PATH = "/tmp/qwen3_gguf/qwen3-0.6b-f16.gguf"
 TEST_PROMPT = "Write a detailed essay about lobsters, covering their biology, habitat, and importance to marine ecosystems."
 MAX_TOKENS = 200

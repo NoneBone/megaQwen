@@ -11,7 +11,7 @@
 namespace cg = cooperative_groups;
 
 // Configuration
-constexpr int LDG_NUM_BLOCKS = 82;
+constexpr int LDG_NUM_BLOCKS = 34;// 82 for 3090, 34 for 4060Ti
 constexpr int LDG_BLOCK_SIZE = 256;
 constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS = 1e-6f;

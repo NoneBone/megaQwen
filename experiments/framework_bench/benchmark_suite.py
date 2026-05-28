@@ -13,7 +13,7 @@ import torch
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B"
 DECODE_TOKENS = 100
 DEFAULT_PROMPTS = [
     "Explain the concept of overfitting in machine learning.",

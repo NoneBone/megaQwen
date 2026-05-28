@@ -10,7 +10,7 @@ from megakernel_weights import load_qwen3_weights
 
 
 class MegakernelGenerator:
-    def __init__(self, model_name="Qwen/Qwen3-0.6B", max_seq_len=2048):
+    def __init__(self, model_name="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", max_seq_len=2048):
         weights = load_qwen3_weights(model_name, max_seq_len=max_seq_len)
         kernel = _compile_decode_kernel()
         self.decoder = kernel.MegakernelDecoder(
@@ -29,7 +29,7 @@ class MegakernelGenerator:
     def generate(self, prompt, max_new_tokens=100, temperature=1.0, stop_tokens=None):
         self.decoder.reset()
         input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
-        for token_id in input_ids[:-1]:
+        for token_id in input_ids[:-1]: # fake prefill调度
             self.decoder.decode_step(token_id)
 
         generated = []
@@ -64,7 +64,7 @@ class MegakernelGenerator:
 
 
 class MegakernelPrefillGenerator:
-    def __init__(self, model_name="Qwen/Qwen3-0.6B", max_seq_len=2048, max_prefill_len=512):
+    def __init__(self, model_name="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", max_seq_len=2048, max_prefill_len=512):
         weights = load_qwen3_weights(model_name, max_seq_len=max_seq_len)
         kernel = _compile_prefill_kernel()
         self.decoder = kernel.MegakernelPrefillDecoder(
@@ -74,6 +74,24 @@ class MegakernelPrefillGenerator:
             weights["lm_head_weight"],
             weights["cos_table"],
             weights["sin_table"],
+            weights.get("split_q_w4_packed", []),
+            weights.get("split_q_w4_scales", []),
+            weights.get("split_q_w4_codebook", []),
+            weights.get("split_k_w4_packed", []),
+            weights.get("split_k_w4_scales", []),
+            weights.get("split_k_w4_codebook", []),
+            weights.get("split_v_w4_packed", []),
+            weights.get("split_v_w4_scales", []),
+            weights.get("split_v_w4_codebook", []),
+            weights.get("split_o_w4_packed", []),
+            weights.get("split_o_w4_scales", []),
+            weights.get("split_o_w4_codebook", []),
+            weights.get("split_gateup_w4_packed", []),
+            weights.get("split_gateup_w4_scales", []),
+            weights.get("split_gateup_w4_codebook", []),
+            weights.get("split_down_w4_packed", []),
+            weights.get("split_down_w4_scales", []),
+            weights.get("split_down_w4_codebook", []),
             NUM_LAYERS,
             max_seq_len,
             max_prefill_len,
@@ -129,7 +147,7 @@ class MegakernelPrefillGenerator:
 
 
 class MegakernelFusedPrefillGenerator:
-    def __init__(self, model_name="Qwen/Qwen3-0.6B", max_seq_len=2048, max_prefill_len=64):
+    def __init__(self, model_name="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", max_seq_len=2048, max_prefill_len=64):
         weights = load_qwen3_weights(model_name, max_seq_len=max_seq_len)
         kernel = _compile_fused_prefill_kernel()
         self.decoder = kernel.MegakernelFusedPrefillDecoder(
@@ -206,13 +224,13 @@ def main():
 
     if args.fused_prefill:
         print("Using fused prefill megakernel + decode kernels...")
-        gen = MegakernelFusedPrefillGenerator(max_prefill_len=64)
+        gen = MegakernelFusedPrefillGenerator(max_prefill_len=64)# FIX: Output: ellingingingingingingingingNingNingNingNingNingN
     elif args.prefill:
         print("Using cuBLAS prefill + decode kernels...")
         gen = MegakernelPrefillGenerator()
     else:
         print("Using decode-only kernel...")
-        gen = MegakernelGenerator()
+        gen = MegakernelGenerator()# Output:  Lina. I'm a 22-year-old student from China. I'm interested in studying
 
     prompt = "Hello, my name is"
     if not args.benchmark:

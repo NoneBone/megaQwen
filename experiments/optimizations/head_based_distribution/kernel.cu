@@ -29,7 +29,7 @@
 namespace cg = cooperative_groups;
 
 // Configuration
-constexpr int HBD_NUM_BLOCKS = 82;
+constexpr int HBD_NUM_BLOCKS = 34;// 82 for 3090, 34 for 4060Ti
 constexpr int HBD_BLOCK_SIZE = 256;
 constexpr int HBD_NUM_WARPS = HBD_BLOCK_SIZE / WARP_SIZE;
 constexpr float HBD_RMS_EPS = 1e-6f;

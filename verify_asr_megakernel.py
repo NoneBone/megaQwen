@@ -34,8 +34,8 @@ def _wav_duration_s(path: str) -> float | None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--audio", required=True)
+    ap.add_argument("--model", default="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-ASR-0.6B")
+    ap.add_argument("--audio", default="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/AUDIO/hello.wav")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument(
@@ -50,6 +50,7 @@ def main() -> None:
     ap.add_argument("--max-prefill-len", type=int, default=4096)
     ap.add_argument("--runs", type=int, default=1, help="Timed runs (excluding warmup)")
     ap.add_argument("--warmup", type=int, default=0, help="Warmup runs (not timed)")
+    ap.add_argument("--ENV_METHOD", type=int, default=33, help="Conviently decode beckend control")
     ap.add_argument("--profile", action="store_true", help="Print per-stage timing breakdown")
     ap.add_argument("--stats", action="store_true", help="Print generated token count and stop reason")
     ap.add_argument(
@@ -76,7 +77,7 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    _apply_asr_megakernel_default_knobs()
+    _apply_asr_megakernel_default_knobs(args.ENV_METHOD)
 
     # Step-0 style: print key knobs so perf numbers are reproducible.
     print(
@@ -107,8 +108,10 @@ def main() -> None:
         "MEGAQWEN_SPLIT_O_W4=" + os.environ.get("MEGAQWEN_SPLIT_O_W4", ""),
         "MEGAQWEN_SPLIT_FFN_W4=" + os.environ.get("MEGAQWEN_SPLIT_FFN_W4", ""),
         "MEGAQWEN_SPLIT_FFN_W4_FUSED=" + os.environ.get("MEGAQWEN_SPLIT_FFN_W4_FUSED", ""),
-        "MEGAQWEN_SPLIT_KV_LAYOUT=" + os.environ.get("MEGAQWEN_SPLIT_KV_LAYOUT", ""),
+        "MEGAQWEN_SPLIT_KV_LAYOUT=" + os.environ.get("MEGAQWEN_SPLIT_KV_LAYOUT", ""), # SPLIT_KV
         "MEGAQWEN_SPLIT_KV_PAGED=" + os.environ.get("MEGAQWEN_SPLIT_KV_PAGED", ""),
+        "MEGAQWEN_SPLIT_FLASH_GQA_SHARE=" + os.environ.get("MEGAQWEN_SPLIT_FLASH_GQA_SHARE", ""),
+        "MEGAQWEN_SPLIT_FLASH_GQA_MODE=" + os.environ.get("MEGAQWEN_SPLIT_FLASH_GQA_MODE", ""),
         "MEGAQWEN_SPLIT_KV_BLOCK_SIZE=" + os.environ.get("MEGAQWEN_SPLIT_KV_BLOCK_SIZE", ""),
         "MEGAQWEN_DEBUG_PAGED_KV=" + os.environ.get("MEGAQWEN_DEBUG_PAGED_KV", ""),
         "MEGAQWEN_DEBUG_PAGED_KV_TOKENS=" + os.environ.get("MEGAQWEN_DEBUG_PAGED_KV_TOKENS", ""),

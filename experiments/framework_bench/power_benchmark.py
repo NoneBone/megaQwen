@@ -20,7 +20,7 @@ os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import torch
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B"
 TEST_PROMPT = "Write a detailed essay about lobsters, covering their biology, habitat, and importance to marine ecosystems."
 MAX_TOKENS = 200
 

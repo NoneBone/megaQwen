@@ -12,24 +12,24 @@
 
 **Prompt**: "Write a detailed essay about lobsters, covering their biology, habitat..." (~22 input tokens)
 
-| Framework | tok/s | Avg Power (W) | Peak Power (W) | tok/J | Speedup vs HF |
-|-----------|-------|---------------|----------------|-------|---------------|
-| **TensorRT-LLM** | **355** | 290 | 290 | **1.22** | **6.01x** |
-| Megakernel | 158 | 205 | 233 | 0.77 | 2.68x |
-| vLLM | 107 | 196 | 206 | 0.55 | 1.82x |
-| SGLang | 107 | 210 | 210 | 0.51 | 1.81x |
-| ExLlamaV2 | 98 | 197 | 207 | 0.50 | 1.66x |
-| HuggingFace | 59 | 186 | 192 | 0.32 | 1.0x |
-| llama.cpp | 50 | 195 | 201 | 0.26 | 0.85x |
+| Framework        | tok/s   | Avg Power (W) | Peak Power (W) | tok/J    | Speedup vs HF |
+| ---------------- | ------- | ------------- | -------------- | -------- | ------------- |
+| **TensorRT-LLM** | **355** | 290           | 290            | **1.22** | **6.01x**     |
+| Megakernel       | 158     | 205           | 233            | 0.77     | 2.68x         |
+| vLLM             | 107     | 196           | 206            | 0.55     | 1.82x         |
+| SGLang           | 107     | 210           | 210            | 0.51     | 1.81x         |
+| ExLlamaV2        | 98      | 197           | 207            | 0.50     | 1.66x         |
+| HuggingFace      | 59      | 186           | 192            | 0.32     | 1.0x          |
+| llama.cpp        | 50      | 195           | 201            | 0.26     | 0.85x         |
 
 ### Short Prompt Benchmark (100 tokens)
 
 **Prompt**: "Hello" (1 input token) - minimal KV cache overhead
 
-| Framework | tok/s | Speedup |
-|-----------|-------|---------|
+| Framework      | tok/s   | Speedup   |
+| -------------- | ------- | --------- |
 | **Megakernel** | **530** | **3.91x** |
-| HuggingFace | 136 | 1.0x |
+| HuggingFace    | 136     | 1.0x      |
 
 **Note**: Decode throughput decreases with longer context due to attention reading more KV cache entries.
 
@@ -46,14 +46,14 @@
 
 After optimization (block divergence + L2 prefetching during attention):
 
-| Position | Before | After | Speedup |
-|----------|--------|-------|---------|
-| 1 | 242 | **525** | 2.17x |
-| 10 | 241 | **527** | 2.19x |
-| 50 | 229 | **500** | 2.18x |
-| 100 | 175 | **472** | 2.70x |
-| 200 | 142 | **422** | 2.97x |
-| 300 | 139 | **382** | 2.75x |
+| Position | Before | After   | Speedup |
+| -------- | ------ | ------- | ------- |
+| 1        | 242    | **525** | 2.17x   |
+| 10       | 241    | **527** | 2.19x   |
+| 50       | 229    | **500** | 2.18x   |
+| 100      | 175    | **472** | 2.70x   |
+| 200      | 142    | **422** | 2.97x   |
+| 300      | 139    | **382** | 2.75x   |
 
 **Optimization**: During attention, only 16 blocks compute (one per Q head). The other 66 blocks prefetch MLP weights into L2 cache using `__ldg`, so when MLP starts, weights are already cached.
 
@@ -61,12 +61,12 @@ After optimization (block divergence + L2 prefetching during attention):
 
 ## 2. Quality Metrics
 
-| Framework | KL Divergence | Argmax Match | Notes |
-|-----------|---------------|--------------|-------|
-| HuggingFace | 0.0 (ref) | 100% | Reference implementation |
-| **Megakernel** | **0.000582** | varies | Near-identical distributions |
-| vLLM | - | 100% | Logits not exposed |
-| llama.cpp | - | - | Token IDs not exposed |
+| Framework      | KL Divergence | Argmax Match | Notes                        |
+| -------------- | ------------- | ------------ | ---------------------------- |
+| HuggingFace    | 0.0 (ref)     | 100%         | Reference implementation     |
+| **Megakernel** | **0.000582**  | varies       | Near-identical distributions |
+| vLLM           | -             | 100%         | Logits not exposed           |
+| llama.cpp      | -             | -            | Token IDs not exposed        |
 
 **KL Divergence Analysis**:
 - Megakernel KL = 0.000582 indicates **near-identical probability distributions**
@@ -79,11 +79,11 @@ After optimization (block divergence + L2 prefetching during attention):
 
 ### Synchronization Overhead (Empty Kernels)
 
-| Approach | Time | Per-Op Cost |
-|----------|------|-------------|
-| Cooperative + 225 grid.sync() | 167.3 us | 0.73 us/sync |
-| CUDA graph (225 kernels) | 186.9 us | 0.83 us/kernel |
-| 225 regular kernel launches | 347.5 us | 1.54 us/launch |
+| Approach                      | Time     | Per-Op Cost    |
+| ----------------------------- | -------- | -------------- |
+| Cooperative + 225 grid.sync() | 167.3 us | 0.73 us/sync   |
+| CUDA graph (225 kernels)      | 186.9 us | 0.83 us/kernel |
+| 225 regular kernel launches   | 347.5 us | 1.54 us/launch |
 
 ### Conclusion
 
@@ -106,12 +106,12 @@ Splitting at grid.sync() points would lose these memory benefits.
 **Syncs eliminated**: 56 (2 per layer x 28 layers)
 
 | Position | Original | Optimized | Speedup |
-|----------|----------|-----------|---------|
-| 1 | 5.655ms | 3.982ms | 1.42x |
-| 10 | 5.708ms | 4.006ms | 1.42x |
-| 50 | 5.819ms | 4.107ms | 1.42x |
-| 100 | 5.936ms | 4.227ms | 1.40x |
-| 200 | 6.202ms | 6.883ms | 0.90x |
+| -------- | -------- | --------- | ------- |
+| 1        | 5.655ms  | 3.982ms   | 1.42x   |
+| 10       | 5.708ms  | 4.006ms   | 1.42x   |
+| 50       | 5.819ms  | 4.107ms   | 1.42x   |
+| 100      | 5.936ms  | 4.227ms   | 1.40x   |
+| 200      | 6.202ms  | 6.883ms   | 0.90x   |
 
 **Result**: +26.3% throughput (170 -> 215 tok/s) at short sequences. Degrades at long sequences due to L2 cache pressure from KV cache.
 
@@ -123,10 +123,10 @@ Splitting at grid.sync() points would lose these memory benefits.
 **Syncs eliminated**: 28 (1 per layer)
 
 | Position | Original | Optimized | Speedup |
-|----------|----------|-----------|---------|
-| 1 | 4.023ms | 6.862ms | 0.59x |
-| 10 | 4.051ms | 6.892ms | 0.59x |
-| 50 | 4.151ms | 6.990ms | 0.59x |
+| -------- | -------- | --------- | ------- |
+| 1        | 4.023ms  | 6.862ms   | 0.59x   |
+| 10       | 4.051ms  | 6.892ms   | 0.59x   |
+| 50       | 4.151ms  | 6.990ms   | 0.59x   |
 
 **Result**: -33% throughput (213 -> 142 tok/s). **Not viable.**
 
@@ -151,13 +151,13 @@ After extensive analysis and benchmarking, we tested multiple kernel-level optim
 
 **Hypothesis**: Dedicate some warps to prefetching while others compute.
 
-| Ratio (P:C) | Pos 1 | Pos 50 | Pos 100 | Pos 200 | Average |
-|-------------|-------|--------|---------|---------|---------|
-| **0:8** | 567.6 | 529.9 | 498.1 | 444.0 | **509.9** |
-| 1:7 | 563.3 | 532.2 | 500.9 | 447.0 | 510.8 |
-| 2:6 | 531.6 | 511.2 | 482.9 | 433.8 | 489.9 |
-| 3:5 | 545.6 | 521.3 | 490.3 | 437.8 | 498.7 |
-| 4:4 | 518.5 | 500.9 | 472.6 | 422.6 | 478.6 |
+| Ratio (P:C) | Pos 1 | Pos 50 | Pos 100 | Pos 200 | Average   |
+| ----------- | ----- | ------ | ------- | ------- | --------- |
+| **0:8**     | 567.6 | 529.9  | 498.1   | 444.0   | **509.9** |
+| 1:7         | 563.3 | 532.2  | 500.9   | 447.0   | 510.8     |
+| 2:6         | 531.6 | 511.2  | 482.9   | 433.8   | 489.9     |
+| 3:5         | 545.6 | 521.3  | 490.3   | 437.8   | 498.7     |
+| 4:4         | 518.5 | 500.9  | 472.6   | 422.6   | 478.6     |
 
 **Result**: No improvement. Reducing consumer warps hurts more than prefetching helps.
 
@@ -165,10 +165,10 @@ After extensive analysis and benchmarking, we tested multiple kernel-level optim
 
 ### 128-bit Vectorized Loads (v2)
 
-| Metric | v1 (64-bit) | v2 (128-bit) | Improvement |
-|--------|-------------|--------------|-------------|
-| Latency | 1.904 ms | 1.838 ms | 3.5% |
-| LDG.E.128 | 0 | 118 | - |
+| Metric    | v1 (64-bit) | v2 (128-bit) | Improvement |
+| --------- | ----------- | ------------ | ----------- |
+| Latency   | 1.904 ms    | 1.838 ms     | 3.5%        |
+| LDG.E.128 | 0           | 118          | -           |
 
 **Result**: +3.5% improvement. Minor gain from better memory coalescing.
 
@@ -188,12 +188,12 @@ After extensive analysis and benchmarking, we tested multiple kernel-level optim
 
 **Approach**: Use `__pipeline_memcpy_async` to prefetch weight tiles while computing current tile.
 
-| Version | Description | Avg Time | Speedup |
-|---------|-------------|----------|---------|
-| v1 | Base __ldg | 1.827ms | 1.00x |
-| v2 | 128-bit loads | 1.777ms | 1.03x |
-| v3 | Register caching | 1.830ms | 1.00x |
-| v4 | cp.async | 1.808ms | 1.01x |
+| Version | Description      | Avg Time | Speedup |
+| ------- | ---------------- | -------- | ------- |
+| v1      | Base __ldg       | 1.827ms  | 1.00x   |
+| v2      | 128-bit loads    | 1.777ms  | 1.03x   |
+| v3      | Register caching | 1.830ms  | 1.00x   |
+| v4      | cp.async         | 1.808ms  | 1.01x   |
 
 **Result**: <3% improvement across all variants.
 
@@ -213,13 +213,13 @@ After extensive analysis and benchmarking, we tested multiple kernel-level optim
 
 **The fundamental bottleneck is grid.sync() latency, not memory bandwidth.**
 
-| Metric | Value |
-|--------|-------|
-| Effective bandwidth | ~47 GB/s |
-| Peak bandwidth | 936 GB/s |
-| Utilization | **5%** |
-| grid.sync() calls | 140+ per token |
-| Sync time estimate | ~0.7 us each |
+| Metric              | Value          |
+| ------------------- | -------------- |
+| Effective bandwidth | ~47 GB/s       |
+| Peak bandwidth      | 936 GB/s       |
+| Utilization         | **5%**         |
+| grid.sync() calls   | 140+ per token |
+| Sync time estimate  | ~0.7 us each   |
 
 With 140 syncs at ~0.7us each = ~100us of pure sync overhead per token.
 
@@ -233,24 +233,24 @@ With 140 syncs at ~0.7us each = ~100us of pure sync overhead per token.
 
 ### What Would Actually Help
 
-| Approach | Expected Gain | Difficulty |
-|----------|---------------|------------|
-| Quantization (INT4) | ~4x | Medium |
-| Non-cooperative architecture | Unknown | High (major rewrite) |
-| Speculative decoding | ~2-4x | Medium |
-| Larger batch size | Linear | N/A for single-user |
+| Approach                     | Expected Gain | Difficulty           |
+| ---------------------------- | ------------- | -------------------- |
+| Quantization (INT4)          | ~4x           | Medium               |
+| Non-cooperative architecture | Unknown       | High (major rewrite) |
+| Speculative decoding         | ~2-4x         | Medium               |
+| Larger batch size            | Linear        | N/A for single-user  |
 
 ---
 
 ## Summary Table
 
-| Metric | TensorRT-LLM | Megakernel | vs HuggingFace |
-|--------|--------------|------------|----------------|
-| Decode tok/s (short ctx) | 355 | **531** | 2.61x / **3.91x** |
-| Decode tok/s (long ctx) | 355 | 158 | 6.01x / 2.68x |
-| Energy (tok/J) | 1.22 | 0.77 | 3.81x / 2.41x |
-| Compilation | Required | None | - |
-| KL Divergence | - | 0.000582 | near-identical |
+| Metric                   | TensorRT-LLM | Megakernel | vs HuggingFace    |
+| ------------------------ | ------------ | ---------- | ----------------- |
+| Decode tok/s (short ctx) | 355          | **531**    | 2.61x / **3.91x** |
+| Decode tok/s (long ctx)  | 355          | 158        | 6.01x / 2.68x     |
+| Energy (tok/J)           | 1.22         | 0.77       | 3.81x / 2.41x     |
+| Compilation              | Required     | None       | -                 |
+| KL Divergence            | -            | 0.000582   | near-identical    |
 
 **Key Achievement**: Megakernel beats TensorRT-LLM at short contexts (531 vs 355 tok/s) with zero compilation overhead.
 

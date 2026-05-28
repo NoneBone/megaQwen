@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT))
+
 import json
 import os
 from pathlib import Path
@@ -217,7 +223,7 @@ def _dequantize_bnb4_weight(
     return _as_bf16_contiguous(dequant)
 
 
-def load_qwen3_weights(model_name: str = "Qwen/Qwen3-0.6B", max_seq_len: int = 2048):
+def load_qwen3_weights(model_name: str = "/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", max_seq_len: int = 2048):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_dir = _resolve_local_model_dir(model_name)

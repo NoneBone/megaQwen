@@ -1,4 +1,8 @@
-"""End-to-end token generation using megakernels."""
+"""End-to-end token generation using megakernels.
+TODO: fix the following issues:
+transformer_block_v2.cu: ???
+lm_head.cu: ??? https://github.com/Eigensystem/ThunderKittens/blob/4e41627c1a2c39617d8a8a5c1c570744e23637fe/tests/batch-vm/llama_official/lm_head.cu#L4
+"""
 import os
 import time
 
@@ -16,7 +20,7 @@ MAX_SEQ_LEN = 512
 
 def compile_kernels():
     """Compile all megakernels."""
-    kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "megakernel")
+    kernel_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc/megakernel")
 
     # Read kernel sources
     with open(os.path.join(kernel_dir, "transformer_block_v2.cu")) as f:
@@ -170,7 +174,7 @@ def precompute_rope_freqs(head_dim: int, max_seq_len: int, theta: float = 100000
 class MegakernelModel:
     """Wrapper for running Qwen3-0.6B with megakernels."""
 
-    def __init__(self, model_name="Qwen/Qwen3-0.6B", device="cuda"):
+    def __init__(self, model_name="/media/l8w/Linux118/PROJECTS/29-vllm-serials/00-COMMON/Qwen/Qwen3-0.6B", device="cuda"):
         print("Loading model weights...")
         self.hf_model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16, device_map=device
