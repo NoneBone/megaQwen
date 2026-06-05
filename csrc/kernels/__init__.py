@@ -283,14 +283,35 @@ torch::Tensor cuda_attention_decode##VERSION(                            \
     int cache_len                                                        \
 ) {                                                                      \
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");                  \
+    TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),                   \
+                "k_cache and v_cache must be CUDA tensors");              \
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");     \
+    TORCH_CHECK(k_cache.dtype() == torch::kBFloat16,                      \
+                "k_cache must be bfloat16");                              \
+    TORCH_CHECK(v_cache.dtype() == torch::kBFloat16,                      \
+                "v_cache must be bfloat16");                              \
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");               \
+    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous(),       \
+                "k_cache and v_cache must be contiguous");                \
+    TORCH_CHECK(q.dim() == 4, "q must be [B, Hq, 1, D]");                 \
+    TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,                 \
+                "k_cache/v_cache must be [B, Hkv, S, D]");                \
+    TORCH_CHECK(q.size(2) == 1, "decode q must have sequence length 1");  \
+    TORCH_CHECK(k_cache.sizes() == v_cache.sizes(),                       \
+                "k_cache and v_cache shape mismatch");                    \
                                                                           \
     int batch = q.size(0);                                               \
     int n_q_heads = q.size(1);                                           \
     int head_dim = q.size(3);                                            \
     int n_kv_heads = k_cache.size(1);                                    \
     int max_seq_len = k_cache.size(2);                                   \
+    TORCH_CHECK(k_cache.size(0) == batch && v_cache.size(0) == batch,    \
+                "batch size mismatch between q and KV cache");            \
+    TORCH_CHECK(k_cache.size(3) == head_dim && v_cache.size(3) == head_dim,\
+                "head_dim mismatch between q and KV cache");              \
+    TORCH_CHECK(cache_len >= 0, "cache_len must be non-negative");        \
+    TORCH_CHECK(cache_len <= max_seq_len,                                 \
+                "cache_len exceeds allocated KV cache length");           \
                                                                           \
     float scale = 1.0f / sqrtf((float)head_dim);                         \
                                                                           \

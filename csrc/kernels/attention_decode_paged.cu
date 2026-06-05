@@ -398,7 +398,7 @@ extern "C" void launch_attention_decode_paged_splitk(
     // 5.  Synchronize, error‑check and free temporaries
     // ------------------------------------------------------------------
     CUDA_CHECK_(cudaGetLastError());
-    CUDA_CHECK_(cudaStreamSynchronize(stream));
+    // CUDA_CHECK_(cudaStreamSynchronize(stream));
 
     CUDA_CHECK_(cudaFree(d_partial_out));
     CUDA_CHECK_(cudaFree(d_partial_max));

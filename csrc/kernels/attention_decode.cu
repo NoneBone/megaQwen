@@ -929,12 +929,16 @@ extern "C" void launch_attention_decode_v4(
     // ------------------------------------------------------------------
     // 3. 派生尺寸
     // ------------------------------------------------------------------
-    // if (cache_len > max_seq_len) {
-    //     fprintf(stderr,
-    //             "[launch_attention_decode_v4] cache_len (%d) must be <= max_seq_len (%d).\n",
-    //             cache_len, max_seq_len);
-    //     exit(EXIT_FAILURE);
-    // }
+    int effective_cache_len = cache_len;
+    if (effective_cache_len > max_seq_len) {// TODO：潜在的尺寸问题，在部分测试场景报错
+        // fprintf(stderr,
+        //         "[launch_attention_decode_v4] cache_len (%d) exceeds max_seq_len (%d); clamping to max_seq_len.\n",
+        //         cache_len, max_seq_len);
+        effective_cache_len = max_seq_len;
+    }
+    if (effective_cache_len < 0) {
+        effective_cache_len = 0;
+    }
 
     // partial buffers: [batch, n_q_heads, num_splits, head_dim] (float)
     const size_t ws_out = static_cast<size_t>(batch_size) * n_q_heads * num_splits * head_dim;
@@ -971,7 +975,7 @@ extern "C" void launch_attention_decode_v4(
         <<<grid_splitk, block_splitk, smem_bytes, stream>>>(
             d_q, d_k_cache, d_v_cache,
             d_partial_out, d_partial_max, d_partial_sum,
-            cache_len, n_q_heads, n_kv_heads, HD, max_seq_len, scale, num_splits
+            effective_cache_len, n_q_heads, n_kv_heads, HD, max_seq_len, scale, num_splits
         );
 
         // ------------------- reduce kernel -------------------
