@@ -28,6 +28,7 @@ def _compile_kernels():
     rope_src = _get_cuda_source("rope.cu")
     attention_prefill_src = _get_cuda_source("attention_prefill.cu")
     attention_decode_src = _get_cuda_source("attention_decode.cu")
+    attention_decode_paged_src = _get_cuda_source("attention_decode_paged.cu")
     audio_attention_src = _get_cuda_source("audio_attention.cu")
 
     # Combined source with Python bindings
@@ -105,7 +106,7 @@ extern "C" void launch_attention_decode##VERSION(                     \
     float scale,                                                       \
     cudaStream_t stream                                                \
 )
-extern "C" void launch_attention_decode_v4_new(
+extern "C" void launch_attention_decode_paged_splitk(
     const void* q,
     const void* k_cache,
     const void* v_cache,
@@ -282,14 +283,35 @@ torch::Tensor cuda_attention_decode##VERSION(                            \
     int cache_len                                                        \
 ) {                                                                      \
     TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");                  \
+    TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),                   \
+                "k_cache and v_cache must be CUDA tensors");              \
     TORCH_CHECK(q.dtype() == torch::kBFloat16, "q must be bfloat16");     \
+    TORCH_CHECK(k_cache.dtype() == torch::kBFloat16,                      \
+                "k_cache must be bfloat16");                              \
+    TORCH_CHECK(v_cache.dtype() == torch::kBFloat16,                      \
+                "v_cache must be bfloat16");                              \
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");               \
+    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous(),       \
+                "k_cache and v_cache must be contiguous");                \
+    TORCH_CHECK(q.dim() == 4, "q must be [B, Hq, 1, D]");                 \
+    TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,                 \
+                "k_cache/v_cache must be [B, Hkv, S, D]");                \
+    TORCH_CHECK(q.size(2) == 1, "decode q must have sequence length 1");  \
+    TORCH_CHECK(k_cache.sizes() == v_cache.sizes(),                       \
+                "k_cache and v_cache shape mismatch");                    \
                                                                           \
     int batch = q.size(0);                                               \
     int n_q_heads = q.size(1);                                           \
     int head_dim = q.size(3);                                            \
     int n_kv_heads = k_cache.size(1);                                    \
     int max_seq_len = k_cache.size(2);                                   \
+    TORCH_CHECK(k_cache.size(0) == batch && v_cache.size(0) == batch,    \
+                "batch size mismatch between q and KV cache");            \
+    TORCH_CHECK(k_cache.size(3) == head_dim && v_cache.size(3) == head_dim,\
+                "head_dim mismatch between q and KV cache");              \
+    TORCH_CHECK(cache_len >= 0, "cache_len must be non-negative");        \
+    TORCH_CHECK(cache_len <= max_seq_len,                                 \
+                "cache_len exceeds allocated KV cache length");           \
                                                                           \
     float scale = 1.0f / sqrtf((float)head_dim);                         \
                                                                           \
@@ -319,11 +341,13 @@ torch::Tensor cuda_attention_decode##VERSION(                            \
 DECLARE_LAUNCH_ATTENTION_DECODE(_v1);
 DECLARE_LAUNCH_ATTENTION_DECODE(_v2);
 DECLARE_LAUNCH_ATTENTION_DECODE(_v3);
+DECLARE_LAUNCH_ATTENTION_DECODE(_v4);
 DEFINE_CUDA_ATTENTION_DECODE(_v1)
 DEFINE_CUDA_ATTENTION_DECODE(_v2)
 DEFINE_CUDA_ATTENTION_DECODE(_v3)
+DEFINE_CUDA_ATTENTION_DECODE(_v4)
 
-torch::Tensor cuda_attention_decode_v4(
+torch::Tensor cuda_attention_decode_paged_splitk(
     torch::Tensor q,
     torch::Tensor k_cache,
     torch::Tensor v_cache,
@@ -370,7 +394,7 @@ torch::Tensor cuda_attention_decode_v4(
         d_seq_lens = seq_lens.data_ptr<int>();
     }
 
-    launch_attention_decode_v4_new(
+    launch_attention_decode_paged_splitk(
         q_flat.data_ptr(),
         k_cache.data_ptr(),
         v_cache.data_ptr(),
@@ -495,6 +519,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("attention_decode_v2", &cuda_attention_decode_v2, "CUDA attention decode");
     m.def("attention_decode_v3", &cuda_attention_decode_v3, "CUDA attention decode");
     m.def("attention_decode_v4", &cuda_attention_decode_v4, "CUDA attention decode");
+    m.def("attention_decode_paged_splitk", &cuda_attention_decode_paged_splitk, "CUDA attention decode");
     m.def("audio_attention", &cuda_audio_attention, "CUDA audio self-attention (B,H,T,D)");
 }
 """
@@ -509,6 +534,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         + attention_prefill_src
         + "\n\n"
         + attention_decode_src
+        + "\n\n"
+        + attention_decode_paged_src
         + "\n\n"
         + audio_attention_src
     )

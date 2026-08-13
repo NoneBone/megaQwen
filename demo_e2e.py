@@ -5,7 +5,7 @@ Streams tokens to screen as they are generated.
 
 import time
 from dataclasses import dataclass
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 
 import torch
 import triton
@@ -18,9 +18,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ============================================================================
 
 class Attn_method:
-    use_flash_attn = 1
+    use_flash_attn = 0
     PREFILL = {"v1":"naive","v2":"cuda","v3":"flash"}
-    DECODE = {"v1":"v1","v2":"best","v3":"largeBatch", "v4":"spport in the ..kvCache.py"}
+    DECODE = {"v1":"v1","v2":"best","v3":"largeBatch", "v4":"splitk", "paged_splitk":"paged"}
 
 @dataclass
 class Qwen3Config:
@@ -49,12 +49,32 @@ def make_input_ids(tokenizer: AutoTokenizer, length: int, device: torch.device) 
     token = tokenizer.encode("Hello", add_special_tokens=False)[0]
     return torch.full((1, length), token, dtype=torch.long, device=device)
 
+def bytes_to_mib(num_bytes: int) -> float:
+    return num_bytes / (1024 ** 2)
+
+
+def gpu_mem_snapshot(device: int) -> Dict[str, int]:
+    total = torch.cuda.get_device_properties(device).total_memory
+    reserved = torch.cuda.memory_reserved(device)
+    allocated = torch.cuda.memory_allocated(device)
+    return {
+        "total": total,
+        "reserved": reserved,
+        "allocated": allocated,
+        "free": total - reserved,
+    }
+
+
+def add_mem_stats(stats: Dict[str, object], prefix: str, snapshot: Dict[str, int]) -> None:
+    stats[f"{prefix}_allocated_mib"] = bytes_to_mib(snapshot["allocated"])
+    stats[f"{prefix}_reserved_mib"] = bytes_to_mib(snapshot["reserved"])
+    stats[f"{prefix}_free_mib"] = bytes_to_mib(snapshot["free"])
 
 def benchmark_model(
     model,                     # Qwen3Model instance
     input_ids: torch.Tensor,   # prompt tensor
     max_new_tokens: int,       # number of decode steps
-) -> Tuple[int, Dict[str, float]]:
+) -> Tuple[int, Dict[str, object]]:
     """
     Run a full generation (prefill + decode) and return:
         * total generated tokens (including prompt)
@@ -66,16 +86,39 @@ def benchmark_model(
             - decode_time (ms)
             - decode_speed (tok/s)
     """
+    device = torch.cuda.current_device()
+    stats: Dict[str, object] = {}
+
+    torch.cuda.synchronize()
+    init_mem = gpu_mem_snapshot(device)
+    add_mem_stats(stats, "init", init_mem)
+
     # ---------- Prefill ----------
+    torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    logits, kv_caches, prompt_len = model.prefill(input_ids)
+    logits, kv_caches, prompt_len = model.prefill(input_ids, reserve_decode_steps=max_new_tokens)
     torch.cuda.synchronize()
     prefill_time = (time.perf_counter() - t0) * 1e3          # ms
+
+    prefill_mem = gpu_mem_snapshot(device)
+    add_mem_stats(stats, "prefill_end", prefill_mem)
+    prefill_peak_allocated = torch.cuda.max_memory_allocated(device)
+    prefill_peak_reserved = torch.cuda.max_memory_reserved(device)
+    stats["prefill_peak_allocated_mib"] = bytes_to_mib(prefill_peak_allocated)
+    stats["prefill_peak_reserved_mib"] = bytes_to_mib(prefill_peak_reserved)
 
     # ---------- Decode ----------
     next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
     decode_steps = max_new_tokens
+    decode_start_mem = gpu_mem_snapshot(device)
+    add_mem_stats(stats, "decode_start", decode_start_mem)
+
+    torch.cuda.reset_peak_memory_stats(device)
+    decode_peak_allocated = torch.cuda.max_memory_allocated(device)
+    decode_peak_reserved = torch.cuda.max_memory_reserved(device)
+    decode_peak_step = 0
+
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for step in range(decode_steps):
@@ -83,20 +126,45 @@ def benchmark_model(
             next_token, kv_caches, prompt_len + step
         )
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+        current_peak_allocated = torch.cuda.max_memory_allocated(device)
+        current_peak_reserved = torch.cuda.max_memory_reserved(device)
+        if (
+            current_peak_allocated > decode_peak_allocated
+            or current_peak_reserved > decode_peak_reserved
+        ):
+            decode_peak_allocated = current_peak_allocated
+            decode_peak_reserved = current_peak_reserved
+            decode_peak_step = step + 1
+
     torch.cuda.synchronize()
     decode_time = (time.perf_counter() - t0) * 1e3          # ms
+    decode_end_mem = gpu_mem_snapshot(device)
+    add_mem_stats(stats, "decode_end", decode_end_mem)
+    stats["decode_peak_allocated_mib"] = bytes_to_mib(decode_peak_allocated)
+    stats["decode_peak_reserved_mib"] = bytes_to_mib(decode_peak_reserved)
 
     # ---------- Stats ----------
-    stats = {
+    total_time_ms = prefill_time + decode_time
+    stats.update({
         "prompt_tokens": prompt_len,
         "prefill_time_ms": prefill_time,
         "prefill_speed_toks": (prompt_len / (prefill_time / 1e3)),
         "decode_steps": decode_steps,
         "decode_time_ms": decode_time,
-        "decode_speed_toks": (decode_steps / (decode_time / 1e3)),
-        "total_time_ms": (prefill_time+decode_time),
-        "total_speed_toks": ((prompt_len + decode_steps) / ((prefill_time+decode_time) / 1e3)),
-    }
+        "decode_speed_toks": (decode_steps / (decode_time / 1e3)) if decode_steps else 0.0,
+        "total_time_ms": total_time_ms,
+        "total_speed_toks": ((prompt_len + decode_steps) / (total_time_ms / 1e3)),
+    })
+
+    overall_peak_mib = stats["prefill_peak_allocated_mib"]
+    if decode_peak_allocated > prefill_peak_allocated:
+        overall_peak_mib = stats["decode_peak_allocated_mib"]
+    stats["overall_peak_allocated_mib"] = overall_peak_mib
+    stats["overall_peak_reserved_mib"] = stats["prefill_peak_reserved_mib"]
+    if decode_peak_reserved > prefill_peak_reserved:
+        stats["overall_peak_reserved_mib"] = stats["decode_peak_reserved_mib"]
+
     total_generated = prompt_len + decode_steps
     return total_generated, stats
 
@@ -344,7 +412,8 @@ class Qwen3Attention:
             return o
         else:
             if self.backend == Backend.CUDA:
-                o = self.cuda_kernels.attention_decode_v2(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), cache_len) # decode kernel调度
+                o = self.cuda_kernels.attention_decode_v4(q.contiguous(), k_cache.contiguous(), v_cache.contiguous(), 
+                                                          cache_len) # decode kernel调度
                 return o
             else:
                 o = attention_decode_torch(q, k_cache, v_cache, cache_len)
@@ -475,7 +544,7 @@ class Qwen3Layer:
         hidden_states = self.rms_norm(hidden_states, self.input_layernorm_weight)
         hidden_states, k_cache, v_cache = self.self_attn.forward(
             hidden_states, cos, sin, position_ids, k_cache, v_cache, cache_position, is_prefill
-        )# Prefill调度
+        )# Prefill or Decode 调度
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.rms_norm(hidden_states, self.post_attention_layernorm_weight)
@@ -485,10 +554,18 @@ class Qwen3Layer:
 
 
 class Qwen3Model:
-    def __init__(self, hf_model, config: Qwen3Config, backend: str, cuda_kernels=None):
+    def __init__(
+        self,
+        hf_model,
+        config: Qwen3Config,
+        backend: str,
+        cuda_kernels=None,
+        max_new_tokens: int = 256,
+    ):
         self.config = config
         self.backend = backend
         self.cuda_kernels = cuda_kernels
+        self.max_new_tokens = max_new_tokens
         self.device = next(hf_model.parameters()).device
         self.dtype = torch.bfloat16
         state_dict = hf_model.state_dict()
@@ -501,6 +578,18 @@ class Qwen3Model:
             self.layers.append(Qwen3Layer(layer_weights, config, i, backend, cuda_kernels))
         self.cos, self.sin = precompute_rope_freqs(config.head_dim, config.max_position_embeddings, config.rope_theta, self.device)
 
+    def _required_cache_len(self, prompt_len: int, reserve_decode_steps: int) -> int:
+        total_len = prompt_len + max(reserve_decode_steps, 0)
+        if prompt_len > self.config.max_position_embeddings:
+            raise ValueError(
+                f"prompt length {prompt_len} exceeds max_position_embeddings {self.config.max_position_embeddings}"
+            )
+        if total_len > self.config.max_position_embeddings:
+            raise ValueError(
+                f"prompt+decode length {total_len} exceeds max_position_embeddings {self.config.max_position_embeddings}"
+            )
+        return total_len
+
     def rms_norm(self, x, weight):
         if self.backend == Backend.TORCH:
             return torch_rms_norm_sequential(x, weight, self.config.rms_norm_eps)
@@ -509,12 +598,14 @@ class Qwen3Model:
         else:  # CUDA
             return self.cuda_kernels.rms_norm(x.contiguous(), weight, self.config.rms_norm_eps)
 
-    def prefill(self, input_ids):
+    def prefill(self, input_ids, reserve_decode_steps: Optional[int] = None):
         batch, seq_len = input_ids.shape
         hidden_states = torch.nn.functional.embedding(input_ids, self.embed_tokens)
         position_ids = torch.arange(seq_len, device=self.device).unsqueeze(0)
         kv_caches = []
-        max_cache_len = seq_len + 512
+        if reserve_decode_steps is None:
+            reserve_decode_steps = self.max_new_tokens
+        max_cache_len = self._required_cache_len(seq_len, reserve_decode_steps)
         for layer in self.layers:
             k_cache = torch.zeros(batch, self.config.num_key_value_heads, max_cache_len, self.config.head_dim, device=self.device, dtype=self.dtype)
             v_cache = torch.zeros(batch, self.config.num_key_value_heads, max_cache_len, self.config.head_dim, device=self.device, dtype=self.dtype)
@@ -530,6 +621,11 @@ class Qwen3Model:
         new_kv_caches = []
         for i, layer in enumerate(self.layers):
             k_cache, v_cache = kv_caches[i]
+            if cache_position >= k_cache.size(2):
+                raise ValueError(
+                    f"decode cache_position {cache_position} exceeds KV cache capacity {k_cache.size(2)} "
+                    f"for layer {i}; increase reserved decode steps"
+                )
             hidden_states, k_cache, v_cache = layer.forward(hidden_states, self.cos, self.sin, position_ids, k_cache, v_cache, cache_position, is_prefill=False)# decode 调度
             new_kv_caches.append((k_cache, v_cache))
         hidden_states = self.rms_norm(hidden_states, self.final_norm_weight)
@@ -540,7 +636,7 @@ class Qwen3Model:
     def generate_streaming(self, input_ids, tokenizer, max_new_tokens=100):
         """Generate tokens with streaming output."""
         # Prefill
-        logits, kv_caches, cache_len = self.prefill(input_ids)
+        logits, kv_caches, cache_len = self.prefill(input_ids, reserve_decode_steps=max_new_tokens)
         next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
         tokens_generated = 0
@@ -620,53 +716,68 @@ def run_demo():
     cuda_kernels = get_kernels()
     print("Done!\n")
 
-    # Create config & backend models (only CUDA is exercised in the demo)
-    config = Qwen3Config()
-    torch_model = Qwen3Model(hf_model, config, Backend.TORCH)
-    triton_model = Qwen3Model(hf_model, config, Backend.TRITON)
-    cuda_model = Qwen3Model(hf_model, config, Backend.CUDA, cuda_kernels)
-    
-
     # -----------------------------------------------------------------------
     # Test scenarios (Prompt Tokens, Decode Steps, Total Context, Dominant Phase)
     # -----------------------------------------------------------------------
+    config = Qwen3Config()
     scenarios = [
         # name,   prompt_len, decode_steps, total_context, dominant
-        ("Short",   20,   50,   70,   "decode"),
-        ("Medium", 256,  128,  356,   "balanced"),
-        ("Long",  1024,  156, 1224,   "prefill"),
-        ("Very Long1", 4096, 1024, 4396, "prefill+cache"),
-        ("Very Long2", 8192, 2048, 4396, "prefill-8k"),
-        # ("Very Long3", 16384, 300, 4396, "OOM"),
-        # ("Very Long4", 32768, 300, 4396, "OOM"),
+        ("Short",   64,   16,   80,   "decode"),
+        ("Short",   128,   32,   160,   "decode"),
+        ("Short",   256,   64,   320,   "decode"),
+        ("Medium", 512,  128,  640,   "balanced"),
+        ("Long",  1024,  256, 1280,   "prefill"),
+        ("Very Long1", 4096, 1024, 5120, "prefill+cache"),
+        ("Very Long2", 8192, 2048, 10240, "prefill-8k"),
+        ("Very Long3", 16384, 2048, 20480, "near OOM1"),
+        ("Very Long4", 32768, 2048, 40960, "near OOM2"),# TODO：11.8能测，而在12.8不能测了
     ]
+    model_max_new_tokens = max(256, max(decode_steps for _, _, decode_steps, _, _ in scenarios))
+
+    # Create config & backend models (only CUDA is exercised in the demo)
+    torch_model = Qwen3Model(hf_model, config, Backend.TORCH, max_new_tokens=model_max_new_tokens)
+    triton_model = Qwen3Model(hf_model, config, Backend.TRITON, max_new_tokens=model_max_new_tokens)
+    cuda_model = Qwen3Model(hf_model, config, Backend.CUDA, cuda_kernels, max_new_tokens=model_max_new_tokens)
+
     mod = cuda_model
     # for mod in (cuda_model):# triton_model, torch_model
     if mod:
         fast_answer_test(tokenizer, mod)
+        # header
+        print(
+            "prompts,"
+            "steps,"
+            "total_ms,"
+            "prefill_ms,"
+            "decode_ms,"
+            "total_tok_s,"
+            "prefill_tok_s,"
+            "decode_tok_s,"
+            "peakAloc_MB,"
+            "peakRes_MB"
+        )
         for name, prompt_len, decode_steps, total_ctx, dominant in scenarios:
-            print("-" * 70)
-            print(f"Scenario: {name} (prompt={prompt_len}, decode={decode_steps}) – dominant: {dominant}")
-
+            # print("-" * 70)
+            # print(f"Scenario: {name} (prompt={prompt_len}, decode={decode_steps}) – dominant: {dominant}")
             # Build a dummy prompt of the requested length
             input_ids = make_input_ids(tokenizer, prompt_len, torch.device("cuda"))
 
             # Run benchmark (CUDA backend)
             torch.cuda.synchronize()
             _, stats = benchmark_model(mod, input_ids, decode_steps)
-
-            # Pretty‑print the required fields
-            print(f"Prompt tokens : {stats['prompt_tokens']}")
-            print(f"Prefill time  : {stats['prefill_time_ms']:.1f} ms")
-            print(f"Prefill speed : {stats['prefill_speed_toks']:.0f} tokens/s")
-            print(f"Decode steps  : {stats['decode_steps']}")
-            print(f"Decode time   : {stats['decode_time_ms']:.1f} ms")
-            print(f"Decode speed  : {stats['decode_speed_toks']:.0f} tokens/s")
-            print(f"Total time    : {stats['total_time_ms']:.1f} ms")
-            print(f"Total speed   : {stats['total_speed_toks']:.0f} tokens/s")
-
-            # Print a new line for the next ste
-            print()
+            # data
+            print(
+                f"{stats['prompt_tokens']},"
+                f"{stats['decode_steps']},"
+                f"{stats['total_time_ms']:.1f},"
+                f"{stats['prefill_time_ms']:.1f},"
+                f"{stats['decode_time_ms']:.1f},"
+                f"{stats['total_speed_toks']:.0f},"
+                f"{stats['prefill_speed_toks']:.0f},"
+                f"{stats['decode_speed_toks']:.0f},"
+                f"{stats['overall_peak_allocated_mib']:.1f},"
+                f"{stats['overall_peak_reserved_mib']:.1f}"
+            )
 
     print("=" * 70)
     print("All scenarios completed.")
